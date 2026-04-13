@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv
+venv/
+ENV/
+app.db
+media/
+frames/
+audio/
+*.log
+.DS_Store
