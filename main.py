@@ -323,6 +323,40 @@ def read_visual_records(
         for r in records
     ]
 
+
+@app.get("/candidates/{candidate_id}/visual/latest-frame")
+def read_latest_visual_frame(
+    candidate_id: int,
+    db: Session = Depends(get_db),
+    user: database.User = Depends(require_role(["SuperAdmin", "Recruiter", "Psychologist"])),
+):
+    get_candidate_or_404(db, candidate_id)
+    record = (
+        db.query(database.VisualRecord)
+        .filter(database.VisualRecord.candidate_id == candidate_id)
+        .order_by(database.VisualRecord.timestamp.desc())
+        .first()
+    )
+    if not record or not record.image_url:
+        raise HTTPException(status_code=404, detail="No visual frame available")
+
+    # image_url is stored as "/media/frames/<filename>"
+    filename = Path(record.image_url).name
+    file_path = MEDIA_DIR / "frames" / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Frame file not found")
+
+    encoded = base64.b64encode(file_path.read_bytes()).decode("utf-8")
+    return {
+        "candidate_id": candidate_id,
+        "image": f"data:image/jpeg;base64,{encoded}",
+        "analysis": {
+            "primary_emotion": record.emotion,
+            "stress_level": record.stress_level,
+            "timestamp": record.timestamp.isoformat() if record.timestamp else None,
+        },
+    }
+
 @app.get("/candidates/{candidate_id}", response_model=schemas.CandidateSchema)
 def read_candidate(candidate_id: int, db: Session = Depends(get_db)):
     return get_candidate_or_404(db, candidate_id)
