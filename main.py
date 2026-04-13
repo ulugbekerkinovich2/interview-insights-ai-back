@@ -675,7 +675,7 @@ async def analyze_frame_api(candidate_id: int, file: UploadFile = File(...), db:
     get_candidate_or_404(db, candidate_id)
     
     # Save frame to disk with UUID to prevent guessing
-    ext = os.path.splitext(file.filename)[1] or ".jpg"
+    ext = os.path.splitext(file.filename or "")[1] or ".jpg"
     frame_filename = f"{uuid.uuid4()}{ext}"
     frame_save_path = BACKEND_DIR / "media" / "frames" / frame_filename
     frame_save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -686,43 +686,63 @@ async def analyze_frame_api(candidate_id: int, file: UploadFile = File(...), db:
     tmp_path = frame_save_path
     
     try:
-        res = logic.analyze_visual_frame(str(tmp_path))
-        
-        # Bazaga saqlash
-        record = database.VisualRecord(
-            candidate_id=candidate_id,
-            emotion=res.get("primary_emotion"),
-            stress_level=res.get("stress_level"),
-            notes=res.get("behavior_notes"),
-            image_url=f"/media/frames/{frame_filename}"
-        )
-        db.add(record)
-        db.commit()
-        
-        # Get base64 for real-time video preview on admin side
-        import base64
-        with open(tmp_path, "rb") as image_file:
-            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+        res = logic.analyze_visual_frame(str(tmp_path)) or {}
+        if not isinstance(res, dict):
+            res = {}
 
-        # Adminkaga real-time yuborish (Broadcast)
-        live_data = {
-            "type": "LIVE_VISUAL",
-            "candidate_id": candidate_id,
-            "analysis": res,
-            "image": f"data:image/jpeg;base64,{encoded_string}",
-            "timestamp": datetime.datetime.utcnow().isoformat()
-        }
-        await manager.broadcast(live_data)
-        
-        # Notify on high stress
-        if res.get("stress_level") == "High":
-            await manager.broadcast({
-                "type": "NOTIFICATION",
-                "message": f"⚠️ Diqqat! Nomzodda (ID: {candidate_id}) yuqori hayajon aniqlandi.",
-                "timestamp": datetime.datetime.now().strftime("%H:%M:%S")
-            })
+        # Guarantee stable response shape so frontend never breaks on intermittent failures.
+        res.setdefault("primary_emotion", "Unknown")
+        res.setdefault("stress_level", "Unknown")
+        res.setdefault("gaze_direction", "Unknown")
+        res.setdefault("behavior_notes", "")
+
+        # Best-effort DB save (do not fail endpoint if DB is under pressure).
+        try:
+            record = database.VisualRecord(
+                candidate_id=candidate_id,
+                emotion=res.get("primary_emotion"),
+                stress_level=res.get("stress_level"),
+                notes=res.get("behavior_notes"),
+                image_url=f"/media/frames/{frame_filename}"
+            )
+            db.add(record)
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            print(f"analyze-frame db save failed: {exc}")
+
+        # Best-effort realtime broadcast.
+        try:
+            with open(tmp_path, "rb") as image_file:
+                encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
+
+            live_data = {
+                "type": "LIVE_VISUAL",
+                "candidate_id": candidate_id,
+                "analysis": res,
+                "image": f"data:image/jpeg;base64,{encoded_string}",
+                "timestamp": datetime.datetime.utcnow().isoformat()
+            }
+            await manager.broadcast(live_data)
+
+            if res.get("stress_level") == "High":
+                await manager.broadcast({
+                    "type": "NOTIFICATION",
+                    "message": f"⚠️ Diqqat! Nomzodda (ID: {candidate_id}) yuqori hayajon aniqlandi.",
+                    "timestamp": datetime.datetime.now().strftime("%H:%M:%S")
+                })
+        except Exception as exc:
+            print(f"analyze-frame broadcast failed: {exc}")
 
         return res
+    except Exception as exc:
+        print(f"analyze-frame failed: {exc}")
+        return {
+            "primary_emotion": "Unknown",
+            "stress_level": "Unknown",
+            "gaze_direction": "Unknown",
+            "behavior_notes": f"Frame processing error: {exc}",
+        }
     finally:
         # We keep the file on disk now
         pass
