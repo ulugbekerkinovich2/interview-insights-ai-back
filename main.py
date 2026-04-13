@@ -111,6 +111,9 @@ class WebRTCRoom:
     def __init__(self):
         self.admin: Optional[WebSocket] = None
         self.candidate: Optional[WebSocket] = None
+        # Buffer signaling messages if peer is not connected yet.
+        self.pending_for_admin: List[dict] = []
+        self.pending_for_candidate: List[dict] = []
 
     def other(self, ws: WebSocket) -> Optional[WebSocket]:
         if ws == self.admin:
@@ -118,6 +121,19 @@ class WebRTCRoom:
         if ws == self.candidate:
             return self.admin
         return None
+
+    def enqueue_for(self, target: str, message: dict, max_len: int = 100):
+        q = self.pending_for_admin if target == "admin" else self.pending_for_candidate
+        q.append(message)
+        # Keep bounded to avoid memory growth on unstable clients.
+        if len(q) > max_len:
+            del q[: len(q) - max_len]
+
+    def flush_for(self, target: str) -> List[dict]:
+        q = self.pending_for_admin if target == "admin" else self.pending_for_candidate
+        out = list(q)
+        q.clear()
+        return out
 
 webrtc_rooms: Dict[int, WebRTCRoom] = {}
 
@@ -739,6 +755,22 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
     else:
         room.candidate = websocket
 
+    # Flush any buffered messages destined for this side.
+    try:
+        for buffered in room.flush_for(actor_type):
+            await websocket.send_json(buffered)
+    except Exception:
+        pass
+
+    # Let this side know if peer is already connected.
+    try:
+        if actor_type == "admin" and room.candidate:
+            await websocket.send_json({"type": "candidate_joined"})
+        if actor_type == "candidate" and room.admin:
+            await websocket.send_json({"type": "admin_joined"})
+    except Exception:
+        pass
+
     # Notify the other side that someone is ready.
     other = room.other(websocket)
     if other:
@@ -761,6 +793,9 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
             target = room.other(websocket)
             if target:
                 await target.send_json(msg)
+            else:
+                # Buffer until peer connects (prevents "lost offer" when one side joins later).
+                room.enqueue_for("candidate" if actor_type == "admin" else "admin", msg)
     except WebSocketDisconnect:
         pass
     finally:
