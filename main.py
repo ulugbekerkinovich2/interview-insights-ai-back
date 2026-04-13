@@ -620,21 +620,39 @@ def login(request: Request, email: str = Form(...), password: str = Form(...), d
 
 @app.post("/users/register", response_model=schemas.UserSchema)
 def register_user(name: str = Form(...), email: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
-    validate_password_strength(password)
-    existing = db.query(database.User).filter(database.User.email == email).first()
-    if existing:
-        raise HTTPException(status_code=409, detail="Bu email allaqachon ro'yxatdan o'tgan")
+    safe_name = bleach.clean(name.strip(), tags=[], strip=True)
+    safe_email = email.strip().lower()
 
-    db_user = database.User(
-        name=name, 
-        email=email, 
-        password=get_password_hash(password), 
-        role="Recruiter"
-    )
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    return db_user
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="Ism bo'sh bo'lishi mumkin emas")
+    if not safe_email:
+        raise HTTPException(status_code=400, detail="Email bo'sh bo'lishi mumkin emas")
+
+    validate_password_strength(password)
+
+    try:
+        existing = db.query(database.User).filter(database.User.email == safe_email).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="Bu email allaqachon ro'yxatdan o'tgan")
+
+        db_user = database.User(
+            name=safe_name,
+            email=safe_email,
+            password=get_password_hash(password),
+            role="Recruiter"
+        )
+        db.add(db_user)
+        db.commit()
+        db.refresh(db_user)
+        return db_user
+    except HTTPException:
+        raise
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=f"Email allaqachon mavjud: {safe_email}") from exc
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Ro'yxatdan o'tishda backend xatosi: {exc}") from exc
 
 # --- User Management ---
 @app.get("/users/", response_model=List[schemas.UserSchema])

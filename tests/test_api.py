@@ -230,6 +230,45 @@ class BackendApiTests(unittest.TestCase):
         self.assertNotEqual(saved_user.password, "strong123")
         self.assertTrue(main.verify_password("strong123", saved_user.password))
 
+    def test_register_returns_duplicate_email_detail(self):
+        self.client.post(
+            "/users/register",
+            data={
+                "name": "Strong User",
+                "email": "duplicate@example.com",
+                "password": "strong123",
+            },
+        )
+
+        response = self.client.post(
+            "/users/register",
+            data={
+                "name": "Duplicate User",
+                "email": "duplicate@example.com",
+                "password": "strong123",
+            },
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"], "Bu email allaqachon ro'yxatdan o'tgan")
+
+    def test_register_returns_backend_error_detail(self):
+        with patch.object(main, "get_password_hash", side_effect=RuntimeError("hash backend unavailable")):
+            response = self.client.post(
+                "/users/register",
+                data={
+                    "name": "Broken User",
+                    "email": "broken@example.com",
+                    "password": "strong123",
+                },
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            response.json()["detail"],
+            "Ro'yxatdan o'tishda backend xatosi: hash backend unavailable",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
