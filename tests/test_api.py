@@ -60,7 +60,11 @@ class BackendApiTests(unittest.TestCase):
             headers={"Authorization": f"Bearer {token}"},
         )
         self.assertEqual(response.status_code, 200)
-        return response.json()
+        payload = response.json()
+        self.assertIn("pin", payload)
+        self.assertEqual(len(payload["pin"]), 6)
+        self.assertTrue(payload["pin"].isdigit())
+        return payload
 
     def create_user_token(self, email="admin@example.com", role="SuperAdmin"):
         with database.SessionLocal() as db:

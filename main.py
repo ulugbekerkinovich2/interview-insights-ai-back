@@ -311,7 +311,7 @@ def read_visual_records(candidate_id: int, db: Session = Depends(get_db)):
 def read_candidate(candidate_id: int, db: Session = Depends(get_db)):
     return get_candidate_or_404(db, candidate_id)
 
-@app.post("/candidates/", response_model=schemas.CandidateSchema)
+@app.post("/candidates/", response_model=schemas.CandidateCreateResponse)
 def create_candidate(candidate: schemas.CandidateCreate, db: Session = Depends(get_db), current_user: database.User = Depends(require_role(["SuperAdmin", "Recruiter"]))):
     # Sanitize name
     safe_name = bleach.clean(candidate.name, tags=[], strip=True) if candidate.name else ""
@@ -335,9 +335,8 @@ def create_candidate(candidate: schemas.CandidateCreate, db: Session = Depends(g
     
     # Important: We return the plain PIN only ONCE during creation
     # The frontend should display this to the recruiter
-    res = schemas.CandidateSchema.from_orm(db_candidate)
-    # We'll hijack the response for this specific call to include the plain pin
-    # (In production, usually handled by a separate schema or notification)
+    res = schemas.CandidateCreateResponse.from_orm(db_candidate)
+    res.pin = pin
     return res
 
 @app.post("/candidates/login")

@@ -24,6 +24,10 @@ class CandidateSchema(CandidateBase):
     class Config:
         from_attributes = True
 
+class CandidateCreateResponse(CandidateSchema):
+    # Plain 6-digit PIN is returned only once at candidate creation time.
+    pin: Optional[str] = None
+
 class ChatMessageBase(BaseModel):
     role: str
     content: str
