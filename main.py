@@ -629,6 +629,20 @@ async def process_turn_api(
         )
         send_telegram_notification(msg)
 
+        # Real-time push to admin dashboards (AI Diagnostics / Turn updates)
+        await manager.broadcast({
+            "type": "TURN_RESULT",
+            "candidate_id": candidate_id,
+            "question": result.get("question"),
+            "answer": result.get("answer"),
+            "ai": result.get("ai"),
+            "next_suggestion": result.get("next_suggestion"),
+            "audio_url": result.get("audio_url"),
+            "voice_raw": result.get("voice_raw"),
+            "candidate_raw": result.get("candidate_raw"),
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+        })
+
         return result
     except logic.TranscriptionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
