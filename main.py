@@ -290,12 +290,27 @@ def read_candidates(db: Session = Depends(get_db)):
     return candidates
 
 @app.get("/candidates/{candidate_id}/visual", response_model=List[schemas.VisualRecordSchema])
-def read_visual_records(candidate_id: int, db: Session = Depends(get_db)):
+def read_visual_records(
+    candidate_id: int,
+    limit: int = 200,
+    order: str = "asc",
+    db: Session = Depends(get_db),
+):
     get_candidate_or_404(db, candidate_id)
+    if limit < 1:
+        limit = 1
+    if limit > 500:
+        limit = 500
+    order = order.lower().strip()
+    if order not in {"asc", "desc"}:
+        order = "asc"
+
+    order_by = database.VisualRecord.timestamp.asc() if order == "asc" else database.VisualRecord.timestamp.desc()
     records = (
         db.query(database.VisualRecord)
         .filter(database.VisualRecord.candidate_id == candidate_id)
-        .order_by(database.VisualRecord.timestamp.asc())
+        .order_by(order_by)
+        .limit(limit)
         .all()
     )
     return [
