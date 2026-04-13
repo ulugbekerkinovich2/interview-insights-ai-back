@@ -2,7 +2,7 @@ import os
 import secrets
 import string
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, Header, Request
@@ -119,7 +119,7 @@ class WebRTCRoom:
             return self.admin
         return None
 
-webrtc_rooms: dict[int, WebRTCRoom] = {}
+webrtc_rooms: Dict[int, WebRTCRoom] = {}
 
 def _get_room(candidate_id: int) -> WebRTCRoom:
     room = webrtc_rooms.get(candidate_id)
