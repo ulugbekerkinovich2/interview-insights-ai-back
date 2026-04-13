@@ -867,7 +867,9 @@ async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = None):
 
 @app.websocket("/ws/webrtc/{candidate_id}")
 async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optional[str] = None):
+    logger.info(f"[WebRTC] New connection request for candidate_id={candidate_id}, token_present={bool(token)}")
     if not token:
+        logger.warning(f"[WebRTC] Connection rejected: No token provided for candidate_id={candidate_id}")
         await websocket.close(code=4001)
         return
 
@@ -877,8 +879,11 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         role = payload.get("role")
         sub = payload.get("sub")
+        logger.info(f"[WebRTC] Token decoded: role={role}, sub={sub}")
+
         if role == "Candidate" and isinstance(payload.get("candidate_id"), int):
             if int(payload.get("candidate_id")) != int(candidate_id):
+                logger.warning(f"[WebRTC] Candidate ID mismatch: payload={payload.get('candidate_id')} != URL={candidate_id}")
                 await websocket.close(code=4003)
                 return
             actor_type = "candidate"
@@ -886,6 +891,7 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
             # Admin JWT uses sub=email and role=user.role
             email = sub
             if not isinstance(email, str) or "@" not in email:
+                logger.warning(f"[WebRTC] Invalid admin email in token: {email}")
                 await websocket.close(code=4001)
                 return
             # IMPORTANT: do not keep a DB session open for the duration of the websocket.
@@ -893,22 +899,47 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
             with SessionLocal() as session:
                 user = session.query(database.User).filter_by(email=email).first()
                 if not user or not user.is_active:
+                    logger.warning(f"[WebRTC] Admin not found or inactive: {email}")
                     await websocket.close(code=4001)
                     return
                 if user.role not in {"SuperAdmin", "Recruiter", "Psychologist"}:
+                    logger.warning(f"[WebRTC] Unauthorized role: {user.role}")
                     await websocket.close(code=4003)
                     return
             actor_type = "admin"
-    except JWTError:
+        
+        logger.info(f"[WebRTC] Connection authorized: actor_type={actor_type}, candidate_id={candidate_id}")
+
+    except JWTError as e:
+        logger.error(f"[WebRTC] JWT Decode Error: {e}")
+        await websocket.close(code=4001)
+        return
+    except Exception as e:
+        logger.error(f"[WebRTC] Auth Error: {e}")
         await websocket.close(code=4001)
         return
 
     await websocket.accept()
     room = _get_room(int(candidate_id))
+    
     if actor_type == "admin":
+        if room.admin:
+            logger.info(f"[WebRTC] Room {candidate_id}: Replacing existing admin connection")
+            try:
+                await room.admin.close()
+            except:
+                pass
         room.admin = websocket
     else:
+        if room.candidate:
+            logger.info(f"[WebRTC] Room {candidate_id}: Replacing existing candidate connection")
+            try:
+                await room.candidate.close()
+            except:
+                pass
         room.candidate = websocket
+
+    logger.info(f"[WebRTC] {actor_type.capitalize()} joined room {candidate_id}")
 
     # Flush any buffered messages destined for this side.
     try:
