@@ -203,6 +203,14 @@ app.add_middleware(
 def startup():
     if database.DATABASE_URL.startswith("sqlite"):
         database.init_db()
+    # Ensure media directories exist (prevents 500 when saving uploads on fresh deploys)
+    try:
+        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        MEDIA_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+        (MEDIA_DIR / "frames").mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # Avoid failing startup due to filesystem edge cases; endpoints will surface errors if writes fail.
+        pass
 
 # Dependency to get DB session
 def get_db():
@@ -602,6 +610,7 @@ async def process_turn_api(
 
     audio_filename = f"{secrets.token_hex(16)}{ext}"
     save_path = MEDIA_AUDIO_DIR / audio_filename
+    save_path.parent.mkdir(parents=True, exist_ok=True)
     
     with open(save_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
