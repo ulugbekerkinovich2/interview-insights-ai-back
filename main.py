@@ -105,6 +105,7 @@ class ConnectionManager:
                 self.active_connections.remove(connection)
 
 manager = ConnectionManager()
+ADMIN_MEDIA_ROLES = {"SuperAdmin", "Recruiter", "Psychologist"}
 
 # --- WebRTC Signaling ---
 class WebRTCRoom:
@@ -248,6 +249,32 @@ def require_role(roles: List[str]):
     return role_checker
 
 
+def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
+    if not authorization:
+        return None
+    scheme, _, value = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not value:
+        return None
+    return value.strip()
+
+
+def _decode_candidate_token(candidate_token: str) -> Optional[int]:
+    try:
+        payload = jwt.decode(candidate_token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        return None
+
+    if payload.get("role") != "Candidate":
+        return None
+
+    candidate_id = payload.get("candidate_id")
+    if isinstance(candidate_id, int):
+        return candidate_id
+    if isinstance(candidate_id, str) and candidate_id.isdigit():
+        return int(candidate_id)
+    return None
+
+
 def get_candidate_or_404(db: Session, candidate_id: int) -> Candidate:
     candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
     if candidate is None:
@@ -273,22 +300,22 @@ def generate_unique_access_code(db: Session, max_attempts: int = 10) -> str:
 def get_protected_frame(
     filename: str,
     token: Optional[str] = None,
-    db: Session = Depends(get_db),
-    user: Optional[database.User] = Depends(get_current_user),
+    authorization: Optional[str] = Header(default=None),
 ):
-    # Only allow authenticated recruiters/admins to see frames.
-    # <img> tags cannot send Authorization headers reliably, so we also accept a JWT via query param `token`.
-    if not user and token:
-        try:
-            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-            email: str = payload.get("sub")
-            if email:
-                user = db.query(database.User).filter_by(email=email).first()
-        except JWTError:
-            user = None
-
-    if not user:
+    # Keep frame serving DB-free. This endpoint is hit very frequently by live previews.
+    jwt_token = token or _extract_bearer_token(authorization)
+    if not jwt_token:
         raise HTTPException(status_code=401, detail="Rasmga kirish uchun tizimga kiring")
+
+    try:
+        payload = jwt.decode(jwt_token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Noto'g'ri yoki eskirgan token")
+
+    role = payload.get("role")
+    if role not in ADMIN_MEDIA_ROLES:
+        raise HTTPException(status_code=403, detail="Ushbu rasmga kirish uchun ruxsat yo'q")
+
     file_path = MEDIA_DIR / "frames" / filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Rasm topilmadi")
@@ -480,6 +507,68 @@ async def candidate_login(request: Request, access_code: str = Form(...), pin: s
 
     candidate_token = create_candidate_token(candidate.id)
     return {"status": "success", "candidate_id": candidate.id, "name": candidate.name, "candidate_token": candidate_token}
+
+
+@app.post("/candidates/{candidate_id}/pairing-token")
+def create_candidate_pairing_token(
+    candidate_id: int,
+    db: Session = Depends(get_db),
+    _: database.User = Depends(require_role(["SuperAdmin", "Recruiter", "Psychologist"])),
+):
+    candidate = get_candidate_or_404(db, candidate_id)
+    if not candidate.access_code:
+        raise HTTPException(status_code=400, detail="Nomzod uchun havola kodi topilmadi")
+
+    expires_minutes = 30
+    candidate_token = create_candidate_token(candidate.id, expires_minutes=expires_minutes)
+    return {
+        "status": "success",
+        "candidate_id": candidate.id,
+        "access_code": candidate.access_code,
+        "candidate_token": candidate_token,
+        "expires_minutes": expires_minutes,
+    }
+
+
+@app.post("/candidates/login/by-token")
+@limiter.limit("20/minute")
+async def candidate_login_by_token(
+    request: Request,
+    access_code: str = Form(...),
+    candidate_token: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    candidate_id = _decode_candidate_token(candidate_token)
+    if candidate_id is None:
+        raise HTTPException(status_code=401, detail="QR token noto'g'ri yoki eskirgan")
+
+    candidate = (
+        db.query(Candidate)
+        .filter(Candidate.id == candidate_id, Candidate.access_code == access_code)
+        .first()
+    )
+    if not candidate:
+        raise HTTPException(status_code=401, detail="Havola yaroqsiz yoki nomzod topilmadi")
+
+    refreshed_token = create_candidate_token(candidate.id)
+    send_telegram_notification(
+        f"📱 <b>Nomzod QR orqali kirdi</b>\n\n👤 Nomzod: {candidate.name}\n🆔 ID: {candidate.id}\n📍 Holat: Suhbat boshlandi"
+    )
+
+    await manager.broadcast(
+        {
+            "type": "NOTIFICATION",
+            "message": f"📢 Nomzod QR orqali ulandi: {candidate.name}",
+            "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
+        }
+    )
+
+    return {
+        "status": "success",
+        "candidate_id": candidate.id,
+        "name": candidate.name,
+        "candidate_token": refreshed_token,
+    }
 
 @app.put("/candidates/{candidate_id}", response_model=schemas.CandidateSchema)
 def update_candidate(candidate_id: int, candidate: schemas.CandidateCreate, db: Session = Depends(get_db)):
@@ -821,8 +910,8 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
     try:
         for buffered in room.flush_for(actor_type):
             await websocket.send_json(buffered)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"[WebRTC] Error flushing buffer for {actor_type}: {e}")
 
     # Let this side know if peer is already connected.
     try:
@@ -837,16 +926,17 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
     other = room.other(websocket)
     if other:
         try:
+            logger.info(f"[WebRTC] Notifying peer ({'admin' if actor_type=='candidate' else 'candidate'}) that {actor_type} joined")
             await other.send_json({"type": f"{actor_type}_joined"})
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"[WebRTC] Failed to notify peer: {e}")
 
     try:
         while True:
             msg = await websocket.receive_json()
             # Forward only whitelisted signaling message types.
             msg_type = msg.get("type")
-            if msg_type not in {"offer", "answer", "ice", "ready", "ping"}:
+            if msg_type not in {"offer", "answer", "ice", "ready", "ping", "end"}:
                 continue
             if msg_type == "ping":
                 await websocket.send_json({"type": "pong"})
@@ -854,10 +944,16 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
 
             target = room.other(websocket)
             if target:
+                logger.info(f"[WebRTC] Forwarding {msg_type} from {actor_type}")
                 await target.send_json(msg)
+                if msg_type == "end":
+                    break
             else:
+                logger.info(f"[WebRTC] No peer connected, buffering {msg_type} from {actor_type}")
                 # Buffer until peer connects (prevents "lost offer" when one side joins later).
                 room.enqueue_for("candidate" if actor_type == "admin" else "admin", msg)
+                if msg_type == "end":
+                    break
     except WebSocketDisconnect:
         pass
     finally:
