@@ -44,9 +44,11 @@ class BackendApiTests(unittest.TestCase):
             db.query(database.ChatMessage).delete()
             db.query(database.GlobalSetting).delete()
             db.query(database.Candidate).delete()
+            db.query(database.User).delete()
             db.commit()
 
     def create_candidate(self, name="Test Candidate", answers=None):
+        token = self.create_user_token()
         response = self.client.post(
             "/candidates/",
             json={
@@ -55,9 +57,26 @@ class BackendApiTests(unittest.TestCase):
                 "status": "interview_started",
                 "answers": answers or [],
             },
+            headers={"Authorization": f"Bearer {token}"},
         )
         self.assertEqual(response.status_code, 200)
         return response.json()
+
+    def create_user_token(self, email="admin@example.com", role="SuperAdmin"):
+        with database.SessionLocal() as db:
+            user = db.query(database.User).filter(database.User.email == email).first()
+            if user is None:
+                user = database.User(
+                    name="Test Admin",
+                    email=email,
+                    password=main.get_password_hash("admin123"),
+                    role=role,
+                )
+                db.add(user)
+                db.commit()
+                db.refresh(user)
+
+        return main.create_access_token({"sub": email, "role": role})
 
     def test_missing_resources_return_404(self):
         candidate_response = self.client.get("/candidates/999")
@@ -159,17 +178,57 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(saved_candidate.answers[0]["audio_url"], payload["audio_url"])
 
     def test_access_code_generation_retries_collisions(self):
-        self.create_candidate()
-
         with database.SessionLocal() as db:
-            existing = db.query(database.Candidate).first()
-            existing.access_code = "111111"
+            existing = database.Candidate(
+                name="Existing",
+                summary="",
+                status="interview_started",
+                access_code="111111",
+                answers=[],
+            )
+            db.add(existing)
             db.commit()
 
             with patch.object(main.secrets, "choice", side_effect=list("111111222222")):
                 code = main.generate_unique_access_code(db)
 
         self.assertEqual(code, "222222")
+
+    def test_register_rejects_weak_password(self):
+        response = self.client.post(
+            "/users/register",
+            data={
+                "name": "Weak User",
+                "email": "weak@example.com",
+                "password": "123",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "Parol kamida 8 ta belgidan iborat bo'lishi kerak")
+
+    def test_register_creates_recruiter_with_hashed_password(self):
+        response = self.client.post(
+            "/users/register",
+            data={
+                "name": "Strong User",
+                "email": "strong@example.com",
+                "password": "strong123",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["email"], "strong@example.com")
+        self.assertEqual(payload["role"], "Recruiter")
+        self.assertNotIn("password", payload)
+
+        with database.SessionLocal() as db:
+            saved_user = db.query(database.User).filter(database.User.email == "strong@example.com").first()
+
+        self.assertIsNotNone(saved_user)
+        self.assertNotEqual(saved_user.password, "strong123")
+        self.assertTrue(main.verify_password("strong123", saved_user.password))
 
 
 if __name__ == "__main__":

@@ -17,6 +17,9 @@ import datetime
 import requests
 import uuid
 import re
+import base64
+import hashlib
+import bcrypt
 from jose import JWTError, jwt
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -52,15 +55,28 @@ def send_telegram_notification(message: str):
     except Exception as e:
         print(f"Telegram error: {e}")
 
-from passlib.context import CryptContext
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+PASSWORD_HASH_PREFIX = "bcrypt_sha256$"
 
 def get_password_hash(password):
-    return pwd_context.hash(password)
+    digest = hashlib.sha256(password.encode("utf-8")).digest()
+    secret = base64.b64encode(digest)
+    return PASSWORD_HASH_PREFIX + bcrypt.hashpw(secret, bcrypt.gensalt()).decode("utf-8")
 
 def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
+    if not hashed_password:
+        return False
+
+    if hashed_password.startswith(PASSWORD_HASH_PREFIX):
+        raw_hash = hashed_password[len(PASSWORD_HASH_PREFIX):].encode("utf-8")
+        digest = hashlib.sha256(plain_password.encode("utf-8")).digest()
+        secret = base64.b64encode(digest)
+        return bcrypt.checkpw(secret, raw_hash)
+
+    try:
+        return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
+    except ValueError:
+        # bcrypt 5 raises for >72-byte plain secrets; old hashes cannot match safely.
+        return False
 
 from database import Candidate, ChatMessage, GlobalSetting, SessionLocal
 
