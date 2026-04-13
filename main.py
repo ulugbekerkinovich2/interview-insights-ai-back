@@ -106,6 +106,34 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+# --- WebRTC Signaling ---
+class WebRTCRoom:
+    def __init__(self):
+        self.admin: Optional[WebSocket] = None
+        self.candidate: Optional[WebSocket] = None
+
+    def other(self, ws: WebSocket) -> Optional[WebSocket]:
+        if ws == self.admin:
+            return self.candidate
+        if ws == self.candidate:
+            return self.admin
+        return None
+
+webrtc_rooms: dict[int, WebRTCRoom] = {}
+
+def _get_room(candidate_id: int) -> WebRTCRoom:
+    room = webrtc_rooms.get(candidate_id)
+    if room is None:
+        room = WebRTCRoom()
+        webrtc_rooms[candidate_id] = room
+    return room
+
+def create_candidate_token(candidate_id: int, expires_minutes: int = 60 * 24) -> str:
+    return create_access_token(
+        {"sub": f"candidate:{candidate_id}", "role": "Candidate", "candidate_id": candidate_id},
+        expires_delta=datetime.timedelta(minutes=expires_minutes),
+    )
+
 # --- Security Config ---
 # Ensure SECRET_KEY is set via environment variable for production
 SECRET_KEY = os.getenv("SECRET_KEY")
@@ -426,7 +454,8 @@ async def candidate_login(request: Request, access_code: str = Form(...), pin: s
         "timestamp": datetime.datetime.now().strftime("%H:%M:%S")
     })
 
-    return {"status": "success", "candidate_id": candidate.id, "name": candidate.name}
+    candidate_token = create_candidate_token(candidate.id)
+    return {"status": "success", "candidate_id": candidate.id, "name": candidate.name, "candidate_token": candidate_token}
 
 @app.put("/candidates/{candidate_id}", response_model=schemas.CandidateSchema)
 def update_candidate(candidate_id: int, candidate: schemas.CandidateCreate, db: Session = Depends(get_db)):
@@ -664,6 +693,81 @@ async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = None):
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+
+@app.websocket("/ws/webrtc/{candidate_id}")
+async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optional[str] = None, db: Session = Depends(get_db)):
+    if not token:
+        await websocket.close(code=4001)
+        return
+
+    # Identify actor (admin user vs candidate) via JWT.
+    actor_type: Optional[str] = None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        role = payload.get("role")
+        sub = payload.get("sub")
+        if role == "Candidate" and isinstance(payload.get("candidate_id"), int):
+            if int(payload.get("candidate_id")) != int(candidate_id):
+                await websocket.close(code=4003)
+                return
+            actor_type = "candidate"
+        else:
+            # Admin JWT uses sub=email and role=user.role
+            email = sub
+            if not isinstance(email, str) or "@" not in email:
+                await websocket.close(code=4001)
+                return
+            user = db.query(database.User).filter_by(email=email).first()
+            if not user or not user.is_active:
+                await websocket.close(code=4001)
+                return
+            if user.role not in {"SuperAdmin", "Recruiter", "Psychologist"}:
+                await websocket.close(code=4003)
+                return
+            actor_type = "admin"
+    except JWTError:
+        await websocket.close(code=4001)
+        return
+
+    await websocket.accept()
+    room = _get_room(int(candidate_id))
+    if actor_type == "admin":
+        room.admin = websocket
+    else:
+        room.candidate = websocket
+
+    # Notify the other side that someone is ready.
+    other = room.other(websocket)
+    if other:
+        try:
+            await other.send_json({"type": f"{actor_type}_joined"})
+        except Exception:
+            pass
+
+    try:
+        while True:
+            msg = await websocket.receive_json()
+            # Forward only whitelisted signaling message types.
+            msg_type = msg.get("type")
+            if msg_type not in {"offer", "answer", "ice", "ready", "ping"}:
+                continue
+            if msg_type == "ping":
+                await websocket.send_json({"type": "pong"})
+                continue
+
+            target = room.other(websocket)
+            if target:
+                await target.send_json(msg)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        # Cleanup.
+        if room.admin == websocket:
+            room.admin = None
+        if room.candidate == websocket:
+            room.candidate = None
+        if room.admin is None and room.candidate is None:
+            webrtc_rooms.pop(int(candidate_id), None)
 
 @app.post("/auth/login")
 @limiter.limit("5/minute")
