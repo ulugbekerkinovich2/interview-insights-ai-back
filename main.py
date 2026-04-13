@@ -135,17 +135,6 @@ app.add_middleware(
 
 # app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media") # Unsecured mount removed
 
-@app.get("/media/frames/{filename}")
-def get_protected_frame(filename: str, user: database.User = Depends(get_current_user)):
-    # Only allow authenticated recruiters/admins to see frames
-    if not user:
-        raise HTTPException(status_code=401, detail="Rasmga kirish uchun tizimga kiring")
-    file_path = MEDIA_DIR / "frames" / filename
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Rasm topilmadi")
-    from fastapi.responses import FileResponse
-    return FileResponse(file_path)
-
 
 @app.on_event("startup")
 def startup():
@@ -209,6 +198,17 @@ def generate_unique_access_code(db: Session, max_attempts: int = 10) -> str:
 
 
 # --- Health Check ---
+@app.get("/media/frames/{filename}")
+def get_protected_frame(filename: str, user: database.User = Depends(get_current_user)):
+    # Only allow authenticated recruiters/admins to see frames
+    if not user:
+        raise HTTPException(status_code=401, detail="Rasmga kirish uchun tizimga kiring")
+    file_path = MEDIA_DIR / "frames" / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Rasm topilmadi")
+    from fastapi.responses import FileResponse
+    return FileResponse(file_path)
+
 @app.get("/health", response_model=schemas.HealthSchema)
 def health_check():
     try:
