@@ -4,6 +4,8 @@ import json
 import subprocess
 from pathlib import Path
 from faster_whisper import WhisperModel
+from sqlalchemy.orm import Session
+import database
 
 # Project directory for logic is the current folder (backend)
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
