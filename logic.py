@@ -59,7 +59,7 @@ def transcribe_audio(audio_path: str) -> str:
     return transcript
 
 def run_rag_mistral(question: str, answer: str, context: str = ""):
-    rag_script_path = os.path.join(PROJECT_DIR, "rag_mistral_remote.py")
+    rag_script_path = os.path.join(PROJECT_DIR, "utils", "rag_mistral_remote.py")
     if not os.path.exists(rag_script_path):
         raise AIServiceError(f"Script not found: {rag_script_path}")
 
@@ -136,8 +136,8 @@ def build_interview_summary(answers: list) -> str:
     return extract_mistral_answer(raw_output)
 
 def run_voice_profiler(audio_path: str):
-    script_path = os.path.join(PROJECT_DIR, "voice_profiler_test.py")
-    prosody_script = os.path.join(PROJECT_DIR, "prosody_analyzer.py")
+    script_path = os.path.join(PROJECT_DIR, "utils", "voice_profiler_test.py")
+    prosody_script = os.path.join(PROJECT_DIR, "utils", "prosody_analyzer.py")
     
     combined_notes = []
     
@@ -157,7 +157,7 @@ def run_voice_profiler(audio_path: str):
     return " | ".join(combined_notes)
 
 def run_candidate_profiler(audio_path: str, transcript_path: str, visual_path: str, question: str, answer: str, voice_analysis: str, rag_analysis: str):
-    script_path = os.path.join(PROJECT_DIR, "candidate_profiler.py")
+    script_path = os.path.join(PROJECT_DIR, "utils", "candidate_profiler.py")
     if not os.path.exists(script_path):
         return "Candidate profiler script not found"
         
