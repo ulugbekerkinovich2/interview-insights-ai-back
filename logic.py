@@ -2,6 +2,8 @@ import os
 import sys
 import json
 import subprocess
+import tempfile
+import shutil
 from pathlib import Path
 from faster_whisper import WhisperModel
 from sqlalchemy.orm import Session
@@ -36,25 +38,49 @@ def transcribe_audio(audio_path: str) -> str:
     if not os.path.exists(audio_path):
         raise TranscriptionError("Audio file not found")
 
-    try:
+    def _run_transcription(path: str) -> str:
         model = load_whisper_model()
         segments, _ = model.transcribe(
-            audio_path,
+            path,
             beam_size=5,
             vad_filter=True,
             # Auto-detect language for better UX (HR/candidate may speak uz/ru/en).
             language=None,
         )
-
         parts = []
         for segment in segments:
             text = segment.text.strip()
             if text:
                 parts.append(text)
+        return " ".join(parts).strip()
 
-        transcript = " ".join(parts).strip()
+    try:
+        transcript = _run_transcription(audio_path)
     except Exception as exc:
-        raise TranscriptionError(f"Transcription failed: {exc}") from exc
+        # Fallback: some browser-recorded formats fail in current env; convert to wav then retry.
+        ext = Path(audio_path).suffix.lower()
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if ffmpeg_bin and ext in {".webm", ".ogg", ".m4a", ".mp3", ".aac"}:
+            wav_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
+                    wav_path = tmp_wav.name
+                conv = subprocess.run(
+                    [ffmpeg_bin, "-y", "-i", audio_path, "-ac", "1", "-ar", "16000", wav_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if conv.returncode != 0:
+                    raise TranscriptionError(f"Audio conversion failed: {conv.stderr.strip() or conv.stdout.strip()}")
+                transcript = _run_transcription(wav_path)
+            except Exception as fallback_exc:
+                raise TranscriptionError(f"Transcription failed: {fallback_exc}") from fallback_exc
+            finally:
+                if wav_path and os.path.exists(wav_path):
+                    os.remove(wav_path)
+        else:
+            raise TranscriptionError(f"Transcription failed: {exc}") from exc
 
     if not transcript:
         raise TranscriptionError("Transcription produced no text")
