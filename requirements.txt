@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+python-dotenv
+sqlalchemy
+slowapi
+bleach
+passlib[bcrypt]
+python-jose[cryptography]
+requests
+python-multipart
+faster-whisper
+alembic
+psycopg2-binary
