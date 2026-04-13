@@ -9,6 +9,7 @@ passlib[bcrypt]==1.7.4
 python-jose[cryptography]==3.3.0
 requests==2.31.0
 python-multipart==0.0.6
+av==10.0.0
 faster-whisper==0.10.1
 alembic==1.12.1
 psycopg2-binary==2.9.9
