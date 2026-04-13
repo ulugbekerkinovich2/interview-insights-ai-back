@@ -139,6 +139,9 @@ ALLOWED_ORIGINS = [
     "http://localhost:5173",  # Vite dev
     "http://localhost:3000",
     "http://127.0.0.1:5173",
+    "https://interview.misterdev.uz",
+    "https://www.interview.misterdev.uz",
+    "https://interview-api.misterdev.uz",
 ]
 
 app.add_middleware(
