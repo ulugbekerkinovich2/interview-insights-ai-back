@@ -695,7 +695,7 @@ async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = None):
         manager.disconnect(websocket)
 
 @app.websocket("/ws/webrtc/{candidate_id}")
-async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optional[str] = None, db: Session = Depends(get_db)):
+async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optional[str] = None):
     if not token:
         await websocket.close(code=4001)
         return
@@ -717,13 +717,16 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
             if not isinstance(email, str) or "@" not in email:
                 await websocket.close(code=4001)
                 return
-            user = db.query(database.User).filter_by(email=email).first()
-            if not user or not user.is_active:
-                await websocket.close(code=4001)
-                return
-            if user.role not in {"SuperAdmin", "Recruiter", "Psychologist"}:
-                await websocket.close(code=4003)
-                return
+            # IMPORTANT: do not keep a DB session open for the duration of the websocket.
+            # We do a one-off check and immediately close.
+            with SessionLocal() as session:
+                user = session.query(database.User).filter_by(email=email).first()
+                if not user or not user.is_active:
+                    await websocket.close(code=4001)
+                    return
+                if user.role not in {"SuperAdmin", "Recruiter", "Psychologist"}:
+                    await websocket.close(code=4003)
+                    return
             actor_type = "admin"
     except JWTError:
         await websocket.close(code=4001)
