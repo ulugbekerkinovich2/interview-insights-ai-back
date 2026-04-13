@@ -218,8 +218,23 @@ def generate_unique_access_code(db: Session, max_attempts: int = 10) -> str:
 
 # --- Health Check ---
 @app.get("/media/frames/{filename}")
-def get_protected_frame(filename: str, user: database.User = Depends(get_current_user)):
-    # Only allow authenticated recruiters/admins to see frames
+def get_protected_frame(
+    filename: str,
+    token: Optional[str] = None,
+    db: Session = Depends(get_db),
+    user: Optional[database.User] = Depends(get_current_user),
+):
+    # Only allow authenticated recruiters/admins to see frames.
+    # <img> tags cannot send Authorization headers reliably, so we also accept a JWT via query param `token`.
+    if not user and token:
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            email: str = payload.get("sub")
+            if email:
+                user = db.query(database.User).filter_by(email=email).first()
+        except JWTError:
+            user = None
+
     if not user:
         raise HTTPException(status_code=401, detail="Rasmga kirish uchun tizimga kiring")
     file_path = MEDIA_DIR / "frames" / filename
