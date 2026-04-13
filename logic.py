@@ -42,7 +42,8 @@ def transcribe_audio(audio_path: str) -> str:
             audio_path,
             beam_size=5,
             vad_filter=True,
-            language="ru",
+            # Auto-detect language for better UX (HR/candidate may speak uz/ru/en).
+            language=None,
         )
 
         parts = []
