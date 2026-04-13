@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -102,6 +103,26 @@ class BackendApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), [])
+
+    def test_visual_records_include_image_url_when_available(self):
+        candidate = self.create_candidate()
+        with database.SessionLocal() as db:
+            record = database.VisualRecord(
+                candidate_id=candidate["id"],
+                emotion="Happy",
+                stress_level="Low",
+                notes=None,
+                image_url="/media/frames/test.jpg",
+                timestamp=datetime.datetime.utcnow(),
+            )
+            db.add(record)
+            db.commit()
+
+        response = self.client.get(f"/candidates/{candidate['id']}/visual")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["image_url"], "/media/frames/test.jpg")
 
     def test_health_reports_database_status(self):
         response = self.client.get("/health")

@@ -70,6 +70,7 @@ class GlobalSettingSchema(GlobalSettingBase):
 class VisualRecordSchema(BaseModel):
     emotion: Optional[str] = None
     stress_level: Optional[str] = None
+    image_url: Optional[str] = None
     timestamp: str
 
 

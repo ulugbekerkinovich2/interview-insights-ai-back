@@ -302,6 +302,7 @@ def read_visual_records(candidate_id: int, db: Session = Depends(get_db)):
         {
             "emotion": r.emotion,
             "stress_level": r.stress_level,
+            "image_url": r.image_url,
             "timestamp": r.timestamp.isoformat(),
         }
         for r in records
