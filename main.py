@@ -537,7 +537,17 @@ def set_setting(setting: schemas.GlobalSettingBase, db: Session = Depends(get_db
 
 @app.post("/logic/transcribe/")
 async def transcribe_audio_api(file: UploadFile = File(...)):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+    ext = os.path.splitext(file.filename or "")[1]
+    if not ext:
+        # Fallback by content-type
+        if file.content_type == "audio/webm":
+            ext = ".webm"
+        elif file.content_type == "audio/ogg":
+            ext = ".ogg"
+        else:
+            ext = ".wav"
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
         shutil.copyfileobj(file.file, tmp)
         tmp_path = tmp.name
     
@@ -581,7 +591,16 @@ async def process_turn_api(
     candidate = get_candidate_or_404(db, candidate_id)
 
     # Create permanent audio storage path
-    audio_filename = f"{secrets.token_hex(16)}.wav"
+    ext = os.path.splitext(file.filename or "")[1]
+    if not ext:
+        if file.content_type == "audio/webm":
+            ext = ".webm"
+        elif file.content_type == "audio/ogg":
+            ext = ".ogg"
+        else:
+            ext = ".wav"
+
+    audio_filename = f"{secrets.token_hex(16)}{ext}"
     save_path = MEDIA_AUDIO_DIR / audio_filename
     
     with open(save_path, "wb") as buffer:
