@@ -529,7 +529,7 @@ def create_candidate(candidate: schemas.CandidateCreate, db: Session = Depends(g
 
 @app.post("/candidates/login")
 @limiter.limit("5/minute")
-async def candidate_login(request: Request, access_code: str = Form(...), pin: str = Form(...), db: Session = Depends(get_db)):
+def candidate_login(request: Request, access_code: str = Form(...), pin: str = Form(...), db: Session = Depends(get_db)):
     # 1. Find by long access token
     candidate = db.query(Candidate).filter(Candidate.access_code == access_code).first()
     if not candidate:
@@ -540,14 +540,19 @@ async def candidate_login(request: Request, access_code: str = Form(...), pin: s
         raise HTTPException(status_code=401, detail="PIN kod noto'g'ri")
     
     # Notify HR
-    send_telegram_notification(f"🚀 <b>Nomzod sissiyaga kirdi!</b>\n\n👤 Nomzod: {candidate.name}\n🆔 ID: {candidate.id}\n📍 Holat: Suhbat boshlandi")
-    
+    send_telegram_notification(f"🚀 <b>Кандидат вошёл в сессию!</b>\n\n👤 {candidate.name}\n🆔 ID: {candidate.id}")
+
     # Notify admin about candidate joining
-    await manager.broadcast({
-        "type": "NOTIFICATION",
-        "message": f"📢 Nomzod ulandi: {candidate.name}",
-        "timestamp": datetime.datetime.now().strftime("%H:%M:%S")
-    })
+    try:
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(manager.broadcast({
+            "type": "NOTIFICATION",
+            "message": f"📢 Кандидат подключился: {candidate.name}",
+            "timestamp": datetime.datetime.now().strftime("%H:%M:%S")
+        }))
+        loop.close()
+    except Exception:
+        pass
 
     candidate_token = create_candidate_token(candidate.id)
     return {"status": "success", "candidate_id": candidate.id, "name": candidate.name, "candidate_token": candidate_token}
@@ -576,7 +581,7 @@ def create_candidate_pairing_token(
 
 @app.post("/candidates/login/by-token")
 @limiter.limit("20/minute")
-async def candidate_login_by_token(
+def candidate_login_by_token(
     request: Request,
     candidate_token: str = Form(...),
     access_code: Optional[str] = Form(None),
@@ -592,20 +597,23 @@ async def candidate_login_by_token(
         
     candidate = query.first()
     if not candidate:
-        raise HTTPException(status_code=401, detail="Havola yaroqsiz yoki nomzod topilmadi")
+        raise HTTPException(status_code=401, detail="Ссылка недействительна или кандидат не найден")
 
     refreshed_token = create_candidate_token(candidate.id)
     send_telegram_notification(
-        f"📱 <b>Nomzod QR orqali kirdi</b>\n\n👤 Nomzod: {candidate.name}\n🆔 ID: {candidate.id}\n📍 Holat: Suhbat boshlandi"
+        f"📱 <b>Кандидат вошёл по QR</b>\n\n👤 {candidate.name}\n🆔 ID: {candidate.id}"
     )
 
-    await manager.broadcast(
-        {
+    try:
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(manager.broadcast({
             "type": "NOTIFICATION",
-            "message": f"📢 Nomzod QR orqali ulandi: {candidate.name}",
+            "message": f"📢 Кандидат подключился по QR: {candidate.name}",
             "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
-        }
-    )
+        }))
+        loop.close()
+    except Exception:
+        pass
 
     return {
         "status": "success",
@@ -775,7 +783,7 @@ def generate_summary_api(candidate_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/logic/process-turn/")
-async def process_turn_api(
+def process_turn_api(
     candidate_id: int = Form(...),
     question: str = Form(...),
     file: UploadFile = File(...),
@@ -901,7 +909,7 @@ def validate_password_strength(password: str):
     return True
 
 @app.post("/logic/analyze-frame/")
-async def analyze_frame_api(candidate_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+def analyze_frame_api(candidate_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
     get_candidate_or_404(db, candidate_id)
     
     # Save frame to disk with UUID to prevent guessing
@@ -953,14 +961,24 @@ async def analyze_frame_api(candidate_id: int, file: UploadFile = File(...), db:
                 "image": f"data:image/jpeg;base64,{encoded_string}",
                 "timestamp": datetime.datetime.utcnow().isoformat()
             }
-            await manager.broadcast(live_data)
+            try:
+                loop = asyncio.new_event_loop()
+                loop.run_until_complete(manager.broadcast(live_data))
+                loop.close()
+            except Exception:
+                pass
 
             if res.get("stress_level") == "High":
-                await manager.broadcast({
-                    "type": "NOTIFICATION",
-                    "message": f"⚠️ Diqqat! Nomzodda (ID: {candidate_id}) yuqori hayajon aniqlandi.",
-                    "timestamp": datetime.datetime.now().strftime("%H:%M:%S")
-                })
+                try:
+                    loop2 = asyncio.new_event_loop()
+                    loop2.run_until_complete(manager.broadcast({
+                        "type": "NOTIFICATION",
+                        "message": f"⚠️ Внимание! У кандидата (ID: {candidate_id}) обнаружен высокий стресс.",
+                        "timestamp": datetime.datetime.now().strftime("%H:%M:%S")
+                    }))
+                    loop2.close()
+                except Exception:
+                    pass
         except Exception as exc:
             print(f"analyze-frame broadcast failed: {exc}")
 
