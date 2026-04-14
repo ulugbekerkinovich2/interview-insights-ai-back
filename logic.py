@@ -42,35 +42,10 @@ def load_whisper_model():
             _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
     return _whisper_model
 
-def _convert_to_wav(audio_path: str) -> str:
-    """Convert any audio format to 16kHz mono WAV for fastest Whisper processing."""
-    ext = Path(audio_path).suffix.lower()
-    if ext == ".wav":
-        return audio_path  # already wav
-    ffmpeg_bin = shutil.which("ffmpeg")
-    if not ffmpeg_bin:
-        return audio_path  # no ffmpeg, let whisper handle it
-    wav_path = audio_path + ".16k.wav"
-    try:
-        result = subprocess.run(
-            [ffmpeg_bin, "-y", "-i", audio_path, "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", wav_path],
-            capture_output=True, text=True, timeout=15,
-        )
-        if os.path.exists(wav_path) and os.path.getsize(wav_path) > 100:
-            logger.info(f"Audio converted: {ext} → wav ({os.path.getsize(wav_path)} bytes)")
-            return wav_path
-        logger.warning(f"WAV conversion failed: {result.stderr[:200]}")
-    except Exception as e:
-        logger.warning(f"WAV conversion error: {e}")
-    return audio_path
-
 def transcribe_audio(audio_path: str):
     """Returns (transcript, elapsed_ms) tuple."""
     if not os.path.exists(audio_path):
         raise TranscriptionError("Audio file not found")
-
-    # Pre-convert to WAV for speed (webm/ogg → wav is much faster for Whisper)
-    wav_path = _convert_to_wav(audio_path)
 
     def _run_transcription(path: str) -> str:
         model = load_whisper_model()
@@ -91,13 +66,9 @@ def transcribe_audio(audio_path: str):
     import time
     t0 = time.time()
     try:
-        transcript = _run_transcription(wav_path)
+        transcript = _run_transcription(audio_path)
     except Exception as exc:
         raise TranscriptionError(f"Transcription failed: {exc}") from exc
-    finally:
-        # Cleanup converted wav if it was created
-        if wav_path != audio_path and os.path.exists(wav_path):
-            os.remove(wav_path)
 
     elapsed_ms = int((time.time() - t0) * 1000)
     logger.info(f"Whisper STT: {elapsed_ms}ms | {len(transcript)} chars")
@@ -220,11 +191,7 @@ def run_voice_profiler(audio_path: str):
         spec = importlib.util.spec_from_file_location("prosody_analyzer", os.path.join(PROJECT_DIR, "utils", "prosody_analyzer.py"))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        # Convert to wav for librosa compatibility
-        wav = _convert_to_wav(audio_path)
-        data = mod.analyze_prosody(wav)
-        if wav != audio_path and os.path.exists(wav):
-            os.remove(wav)
+        data = mod.analyze_prosody(audio_path)
         return mod.format_report(data)
     except Exception as e:
         logger.warning(f"Voice profiler error: {e}")
