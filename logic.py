@@ -42,10 +42,30 @@ def load_whisper_model():
             _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
     return _whisper_model
 
+def _trim_audio(audio_path: str, max_seconds: int = 15) -> str:
+    """Trim audio to max_seconds using ffmpeg. Returns trimmed path or original."""
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        return audio_path
+    trimmed = audio_path + f".trim{max_seconds}s.wav"
+    try:
+        subprocess.run(
+            [ffmpeg_bin, "-y", "-i", audio_path, "-t", str(max_seconds), "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", trimmed],
+            capture_output=True, text=True, timeout=10,
+        )
+        if os.path.exists(trimmed) and os.path.getsize(trimmed) > 100:
+            return trimmed
+    except Exception:
+        pass
+    return audio_path
+
 def transcribe_audio(audio_path: str):
     """Returns (transcript, elapsed_ms) tuple."""
     if not os.path.exists(audio_path):
         raise TranscriptionError("Audio file not found")
+
+    # Trim to max 15s — prevents 2min+ processing on slow CPU
+    trimmed_path = _trim_audio(audio_path, max_seconds=15)
 
     def _run_transcription(path: str) -> str:
         model = load_whisper_model()
@@ -66,9 +86,12 @@ def transcribe_audio(audio_path: str):
     import time
     t0 = time.time()
     try:
-        transcript = _run_transcription(audio_path)
+        transcript = _run_transcription(trimmed_path)
     except Exception as exc:
         raise TranscriptionError(f"Transcription failed: {exc}") from exc
+    finally:
+        if trimmed_path != audio_path and os.path.exists(trimmed_path):
+            os.remove(trimmed_path)
 
     elapsed_ms = int((time.time() - t0) * 1000)
     logger.info(f"Whisper STT: {elapsed_ms}ms | {len(transcript)} chars")
