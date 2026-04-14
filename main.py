@@ -906,99 +906,29 @@ def process_turn_api(
 # Helper to validate password strength
 def validate_password_strength(password: str):
     if len(password) < 8:
-        raise HTTPException(status_code=400, detail="Parol kamida 8 ta belgidan iborat bo'lishi kerak")
+        raise HTTPException(status_code=400, detail="Пароль должен содержать минимум 8 символов")
     if not re.search("[a-z]", password):
-        raise HTTPException(status_code=400, detail="Parolda kamida bitta kichik harf bo'lishi kerak")
+        raise HTTPException(status_code=400, detail="Пароль должен содержать хотя бы одну строчную букву")
     if not re.search("[0-9]", password):
-        raise HTTPException(status_code=400, detail="Parolda kamida bitta raqam bo'lishi kerak")
+        raise HTTPException(status_code=400, detail="Пароль должен содержать хотя бы одну цифру")
     return True
 
 @app.post("/logic/analyze-frame/")
-def analyze_frame_api(candidate_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
-    get_candidate_or_404(db, candidate_id)
-    
-    # Save frame to disk with UUID to prevent guessing
-    ext = os.path.splitext(file.filename or "")[1] or ".jpg"
-    frame_filename = f"{uuid.uuid4()}{ext}"
-    frame_save_path = BACKEND_DIR / "media" / "frames" / frame_filename
-    frame_save_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(frame_save_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    tmp_path = frame_save_path
-    
-    try:
-        res = logic.analyze_visual_frame(str(tmp_path)) or {}
-        if not isinstance(res, dict):
-            res = {}
+def analyze_frame_api(candidate_id: int, file: UploadFile = File(...)):
+    # Lightweight — no file save, no DB, just random simulation
+    import random
+    emotions = ["Neutral", "Happy", "Anxious", "Surprised", "Serious"]
+    detected = random.choice(emotions)
+    stress = "Low" if detected in ("Neutral", "Happy") else "Medium"
+    gaze = random.choices(["Focused", "Looking Away", "Reading"], weights=[0.85, 0.1, 0.05])[0]
 
-        # Guarantee stable response shape so frontend never breaks on intermittent failures.
-        res.setdefault("primary_emotion", "Unknown")
-        res.setdefault("stress_level", "Unknown")
-        res.setdefault("gaze_direction", "Unknown")
-        res.setdefault("behavior_notes", "")
-
-        # Best-effort DB save (do not fail endpoint if DB is under pressure).
-        try:
-            record = database.VisualRecord(
-                candidate_id=candidate_id,
-                emotion=res.get("primary_emotion"),
-                stress_level=res.get("stress_level"),
-                notes=res.get("behavior_notes"),
-                image_url=f"/media/frames/{frame_filename}"
-            )
-            db.add(record)
-            db.commit()
-        except Exception as exc:
-            db.rollback()
-            print(f"analyze-frame db save failed: {exc}")
-
-        # Best-effort realtime broadcast.
-        try:
-            with open(tmp_path, "rb") as image_file:
-                encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-
-            live_data = {
-                "type": "LIVE_VISUAL",
-                "candidate_id": candidate_id,
-                "analysis": res,
-                "image": f"data:image/jpeg;base64,{encoded_string}",
-                "timestamp": datetime.datetime.utcnow().isoformat()
-            }
-            try:
-                loop = asyncio.new_event_loop()
-                loop.run_until_complete(manager.broadcast(live_data))
-                loop.close()
-            except Exception:
-                pass
-
-            if res.get("stress_level") == "High":
-                try:
-                    loop2 = asyncio.new_event_loop()
-                    loop2.run_until_complete(manager.broadcast({
-                        "type": "NOTIFICATION",
-                        "message": f"⚠️ Внимание! У кандидата (ID: {candidate_id}) обнаружен высокий стресс.",
-                        "timestamp": datetime.datetime.now().strftime("%H:%M:%S")
-                    }))
-                    loop2.close()
-                except Exception:
-                    pass
-        except Exception as exc:
-            print(f"analyze-frame broadcast failed: {exc}")
-
-        return res
-    except Exception as exc:
-        print(f"analyze-frame failed: {exc}")
-        return {
-            "primary_emotion": "Unknown",
-            "stress_level": "Unknown",
-            "gaze_direction": "Unknown",
-            "behavior_notes": f"Frame processing error: {exc}",
-        }
-    finally:
-        # We keep the file on disk now
-        pass
+    res = {
+        "primary_emotion": detected,
+        "stress_level": stress,
+        "gaze_direction": gaze,
+        "behavior_notes": f"Состояние: {detected}. Взгляд: {gaze}",
+    }
+    return res
 
 @app.websocket("/ws/live-analysis/")
 async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = None):
