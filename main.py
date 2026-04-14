@@ -752,54 +752,87 @@ async def process_turn_api(
     audio_filename = f"{secrets.token_hex(16)}{ext}"
     save_path = MEDIA_AUDIO_DIR / audio_filename
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     with open(save_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-    
+
+    # Step 1: FAST — Whisper transcription only (return immediately)
     try:
-        result = logic.process_interview_turn(str(save_path), question, db=db)
-        # Add audio URL to the result
-        result["audio_url"] = f"/media/audio/{audio_filename}"
-
-        answers = list(candidate.answers or [])
-        answers.append(result.copy())
-        candidate.answers = answers
-        db.commit()
-        db.refresh(candidate)
-
-        # Notify HR with summary of the move
-        safe_answer = result.get('answer', '')[:100] + "..."
-        next_q = result.get('next_suggestion', 'Aniqlanmadi')
-        msg = (
-            f"📝 <b>Yangi javob tahlil qilindi</b>\n\n"
-            f"❓ Savol: {question}\n"
-            f"💬 Javob: {safe_answer}\n"
-            f"🧠 AI Insight: {result.get('ai', '')[:150]}...\n\n"
-            f"✨ <b>Tavsiya etilgan keyingi savol:</b>\n<i>{next_q}</i>"
-        )
-        send_telegram_notification(msg)
-
-        # Real-time push to admin dashboards (AI Diagnostics / Turn updates)
-        await manager.broadcast({
-            "type": "TURN_RESULT",
-            "candidate_id": candidate_id,
-            "question": result.get("question"),
-            "answer": result.get("answer"),
-            "ai": result.get("ai"),
-            "next_suggestion": result.get("next_suggestion"),
-            "audio_url": result.get("audio_url"),
-            "voice_raw": result.get("voice_raw"),
-            "candidate_raw": result.get("candidate_raw"),
-            "timestamp": datetime.datetime.utcnow().isoformat(),
-        })
-
-        return result
+        transcript = logic.transcribe_audio(str(save_path))
     except logic.TranscriptionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except logic.AIServiceError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    # Save basic answer to DB immediately
+    basic_result = {
+        "question": question,
+        "answer": transcript,
+        "ai": "",
+        "next_suggestion": "",
+        "voice_raw": "",
+        "candidate_raw": "",
+        "audio_url": f"/media/audio/{audio_filename}",
+    }
+    answers = list(candidate.answers or [])
+    turn_index = len(answers)
+    answers.append(basic_result.copy())
+    candidate.answers = answers
+    db.commit()
+
+    # Step 2: BACKGROUND — AI analysis in a separate thread (non-blocking)
+    import threading
+
+    def run_ai_analysis():
+        try:
+            analysis_db = SessionLocal()
+            ai_result = logic.process_interview_turn(str(save_path), question, db=analysis_db)
+            ai_result["audio_url"] = f"/media/audio/{audio_filename}"
+
+            # Update candidate answers with full AI result
+            cand = analysis_db.query(database.Candidate).filter_by(id=candidate_id).first()
+            if cand:
+                ans = list(cand.answers or [])
+                if turn_index < len(ans):
+                    ans[turn_index] = ai_result.copy()
+                    cand.answers = ans
+                    analysis_db.commit()
+
+            # Push to admin via WebSocket
+            import asyncio
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(manager.broadcast({
+                "type": "TURN_RESULT",
+                "candidate_id": candidate_id,
+                "question": ai_result.get("question"),
+                "answer": ai_result.get("answer"),
+                "ai": ai_result.get("ai"),
+                "next_suggestion": ai_result.get("next_suggestion"),
+                "audio_url": ai_result.get("audio_url"),
+                "voice_raw": ai_result.get("voice_raw"),
+                "candidate_raw": ai_result.get("candidate_raw"),
+                "timestamp": datetime.datetime.utcnow().isoformat(),
+            }))
+            loop.close()
+
+            # Telegram notification
+            safe_answer = ai_result.get('answer', '')[:100] + "..."
+            next_q = ai_result.get('next_suggestion', 'Не определено')
+            msg = (
+                f"📝 <b>Ответ проанализирован</b>\n\n"
+                f"❓ Вопрос: {question}\n"
+                f"💬 Ответ: {safe_answer}\n"
+                f"🧠 AI: {ai_result.get('ai', '')[:150]}...\n\n"
+                f"✨ <b>Рекомендуемый вопрос:</b>\n<i>{next_q}</i>"
+            )
+            send_telegram_notification(msg)
+            analysis_db.close()
+        except Exception as e:
+            logger.error(f"Background AI analysis failed for candidate {candidate_id}: {e}")
+
+    thread = threading.Thread(target=run_ai_analysis, daemon=True)
+    thread.start()
+
+    # Return fast response (transcript only, AI pending)
+    return basic_result
 
 # Helper to validate password strength
 def validate_password_strength(password: str):
