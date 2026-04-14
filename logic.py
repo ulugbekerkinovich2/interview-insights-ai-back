@@ -79,7 +79,7 @@ def transcribe_audio(audio_path: str):
             beam_size=1,
             vad_filter=True,
             condition_on_previous_text=False,
-            language=None,
+            language="ru",
         )
         parts = []
         for segment in segments:
