@@ -110,6 +110,16 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 ADMIN_MEDIA_ROLES = {"SuperAdmin", "Recruiter", "Psychologist"}
+DEFAULT_FEATURE_FLAGS = [
+    {"name": "linkedin_search", "description": "Nomzod profilida LinkedIn qidiruv tugmasini ko'rsatish", "is_enabled": True},
+    {"name": "pdf_export", "description": "Nomzod profilidan PDF hisobot eksportini yoqish", "is_enabled": True},
+    {"name": "voice_tts", "description": "Nomzod sahifasida savolni ovozli o'qib berish (TTS)", "is_enabled": True},
+    {"name": "interview_timer", "description": "Nomzod sessiyasida vaqt taymerini ko'rsatish", "is_enabled": True},
+    {"name": "stress_overlay", "description": "Interview LIVE oynasida stress overlay effektini yoqish", "is_enabled": True},
+    {"name": "gaze_tracking", "description": "AI Visual blokida gaze (nigoh) diagnostikasini ko'rsatish", "is_enabled": True},
+    {"name": "ai_suggestions", "description": "Javobdan keyin AI tavsiya savollarini yaratish", "is_enabled": True},
+    {"name": "vocal_analysis", "description": "Nomzod ovozi bo'yicha prosody va holat tahlilini yoqish", "is_enabled": True},
+]
 
 # --- WebRTC Signaling ---
 class WebRTCRoom:
@@ -217,6 +227,14 @@ def startup():
         # Avoid failing startup due to filesystem edge cases; endpoints will surface errors if writes fail.
         pass
 
+    # Ensure feature toggles exist in every environment.
+    try:
+        with SessionLocal() as db:
+            _ensure_default_feature_flags(db)
+    except Exception as exc:
+        # Do not crash startup; settings page will surface this if DB/migrations are missing.
+        print(f"feature-flag bootstrap skipped: {exc}")
+
 # Dependency to get DB session
 def get_db():
     db = SessionLocal()
@@ -277,6 +295,27 @@ def _decode_candidate_token(candidate_token: str) -> Optional[int]:
     if isinstance(candidate_id, str) and candidate_id.isdigit():
         return int(candidate_id)
     return None
+
+
+def _ensure_default_feature_flags(db: Session) -> int:
+    existing = {f.name: f for f in db.query(database.FeatureFlag).all()}
+    created = 0
+    for feature in DEFAULT_FEATURE_FLAGS:
+        current = existing.get(feature["name"])
+        if current is None:
+            db.add(
+                database.FeatureFlag(
+                    name=feature["name"],
+                    description=feature["description"],
+                    is_enabled=feature["is_enabled"],
+                )
+            )
+            created += 1
+        elif not current.description:
+            current.description = feature["description"]
+    if created:
+        db.commit()
+    return created
 
 
 def get_candidate_or_404(db: Session, candidate_id: int) -> Candidate:
@@ -538,19 +577,19 @@ def create_candidate_pairing_token(
 @limiter.limit("20/minute")
 async def candidate_login_by_token(
     request: Request,
-    access_code: str = Form(...),
     candidate_token: str = Form(...),
+    access_code: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
     candidate_id = _decode_candidate_token(candidate_token)
     if candidate_id is None:
         raise HTTPException(status_code=401, detail="QR token noto'g'ri yoki eskirgan")
 
-    candidate = (
-        db.query(Candidate)
-        .filter(Candidate.id == candidate_id, Candidate.access_code == access_code)
-        .first()
-    )
+    query = db.query(Candidate).filter(Candidate.id == candidate_id)
+    if access_code:
+        query = query.filter(Candidate.access_code == access_code)
+        
+    candidate = query.first()
     if not candidate:
         raise HTTPException(status_code=401, detail="Havola yaroqsiz yoki nomzod topilmadi")
 
@@ -1087,6 +1126,8 @@ def delete_user(user_id: int, db: Session = Depends(get_db), admin: database.Use
 @app.get("/features/", response_model=List[dict])
 def get_features(db: Session = Depends(get_db)):
     # Any logged in user can view flags to adjust frontend state
+    if db.query(database.FeatureFlag.id).count() == 0:
+        _ensure_default_feature_flags(db)
     flags = db.query(database.FeatureFlag).all()
     return [{"id": f.id, "name": f.name, "is_enabled": f.is_enabled, "description": f.description} for f in flags]
 

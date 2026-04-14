@@ -17,10 +17,32 @@ DEFAULT_SQLITE_URL = f"sqlite:///{BACKEND_DIR / 'app.db'}"
 DATABASE_URL = os.getenv("DATABASE_URL") or DEFAULT_SQLITE_URL
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        parsed = int(raw)
+        return parsed if parsed > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _create_engine(database_url: str):
     engine_kwargs = {"pool_pre_ping": True}
     if database_url.startswith("sqlite"):
         engine_kwargs["connect_args"] = {"check_same_thread": False}
+    else:
+        # Production-safe defaults for PostgreSQL/MySQL under concurrent frame/audio traffic.
+        engine_kwargs.update(
+            {
+                "pool_size": _env_int("DB_POOL_SIZE", 10),
+                "max_overflow": _env_int("DB_MAX_OVERFLOW", 20),
+                "pool_timeout": _env_int("DB_POOL_TIMEOUT", 30),
+                "pool_recycle": _env_int("DB_POOL_RECYCLE", 1800),
+                "pool_use_lifo": True,
+            }
+        )
     return create_engine(database_url, **engine_kwargs)
 
 
