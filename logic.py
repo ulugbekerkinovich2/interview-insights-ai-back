@@ -31,7 +31,7 @@ def load_whisper_model():
     global _whisper_model
     if _whisper_model is None:
         # Using base or small for faster inference on CPU
-        _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+        _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
     return _whisper_model
 
 def transcribe_audio(audio_path: str) -> str:
@@ -42,9 +42,9 @@ def transcribe_audio(audio_path: str) -> str:
         model = load_whisper_model()
         segments, _ = model.transcribe(
             path,
-            beam_size=5,
+            beam_size=1,
             vad_filter=True,
-            # Auto-detect language for better UX (HR/candidate may speak uz/ru/en).
+            condition_on_previous_text=False,
             language=None,
         )
         parts = []
