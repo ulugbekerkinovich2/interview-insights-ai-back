@@ -696,6 +696,9 @@ async def transcribe_audio_api(file: UploadFile = File(...)):
         return {"text": text, "elapsed_ms": elapsed_ms}
     except logic.TranscriptionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error(f"Transcription unexpected error: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"STT error: {exc}") from exc
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
