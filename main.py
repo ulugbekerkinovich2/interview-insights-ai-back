@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+import asyncio
 import shutil
 import tempfile
 import datetime
@@ -732,7 +733,7 @@ async def transcribe_audio_api(file: UploadFile = File(...)):
         tmp_path = tmp.name
     
     try:
-        text, elapsed_ms = logic.transcribe_audio(tmp_path)
+        text, elapsed_ms = await asyncio.to_thread(logic.transcribe_audio, tmp_path)
         return {"text": text, "elapsed_ms": elapsed_ms}
     except logic.TranscriptionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -744,28 +745,28 @@ async def transcribe_audio_api(file: UploadFile = File(...)):
             os.remove(tmp_path)
 
 @app.post("/logic/analyze/")
-def analyze_answer_api(question: str, answer: str):
+async def analyze_answer_api(question: str, answer: str):
     try:
-        analysis = logic.analyze_answer(question, answer)
+        analysis = await asyncio.to_thread(logic.analyze_answer, question, answer)
     except logic.AIServiceError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"analysis": analysis}
-    
+
 @app.post("/logic/ask/")
-def ask_mistral_api(prompt: str):
+async def ask_mistral_api(prompt: str):
     try:
-        response = logic.ask_mistral_raw(prompt)
+        response = await asyncio.to_thread(logic.ask_mistral_raw, prompt)
     except logic.AIServiceError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"response": response}
 
 
 @app.post("/logic/summary/")
-def generate_summary_api(candidate_id: int, db: Session = Depends(get_db)):
+async def generate_summary_api(candidate_id: int, db: Session = Depends(get_db)):
     candidate = get_candidate_or_404(db, candidate_id)
-    
+
     try:
-        summary = logic.build_interview_summary(candidate.answers)
+        summary = await asyncio.to_thread(logic.build_interview_summary, candidate.answers)
     except logic.AIServiceError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     candidate.summary = summary
@@ -799,18 +800,22 @@ async def process_turn_api(
     with open(save_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Step 1: FAST — Whisper transcription + voice prosody (both local, no network)
+    # Step 1: FAST — Whisper + voice prosody in parallel threads (non-blocking)
+    audio_path = str(save_path)
     try:
-        transcript, stt_ms = logic.transcribe_audio(str(save_path))
+        stt_task = asyncio.to_thread(logic.transcribe_audio, audio_path)
+        voice_task = asyncio.to_thread(logic.run_voice_profiler, audio_path)
+        (transcript, stt_ms), voice_raw = await asyncio.gather(stt_task, voice_task, return_exceptions=False)
     except logic.TranscriptionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    # Voice analysis (local librosa — fast, no AI server needed)
-    voice_raw = ""
-    try:
-        voice_raw = logic.run_voice_profiler(str(save_path))
-    except Exception as e:
-        logger.warning(f"Voice profiling failed: {e}")
+    except Exception as exc:
+        # Voice failed but transcript might have succeeded
+        logger.warning(f"process-turn parallel error: {exc}")
+        try:
+            transcript, stt_ms = await asyncio.to_thread(logic.transcribe_audio, audio_path)
+            voice_raw = ""
+        except logic.TranscriptionError as te:
+            raise HTTPException(status_code=400, detail=str(te)) from te
 
     # Save basic answer to DB immediately
     basic_result = {
@@ -915,7 +920,7 @@ async def analyze_frame_api(candidate_id: int, file: UploadFile = File(...), db:
     tmp_path = frame_save_path
     
     try:
-        res = logic.analyze_visual_frame(str(tmp_path)) or {}
+        res = await asyncio.to_thread(logic.analyze_visual_frame, str(tmp_path)) or {}
         if not isinstance(res, dict):
             res = {}
 
