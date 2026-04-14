@@ -141,6 +141,35 @@ def extract_mistral_answer(raw_text: str) -> str:
             if cleaned:
                 return cleaned
     return raw_text.strip()
+    
+def ask_mistral_raw(prompt: str) -> str:
+    rag_script_path = os.path.join(PROJECT_DIR, "utils", "rag_mistral_remote.py")
+    if not os.path.exists(rag_script_path):
+        raise AIServiceError(f"Script not found: {rag_script_path}")
+
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    
+    try:
+        result = subprocess.run(
+            [sys.executable, rag_script_path, "--prompt", prompt.strip()],
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=60, 
+        )
+        if result.returncode != 0:
+            raise AIServiceError(result.stderr.strip() or result.stdout.strip() or "AI process failed")
+        
+        return extract_mistral_answer(result.stdout.strip())
+    except subprocess.TimeoutExpired:
+        raise AIServiceError("AI tahlil serveri so'rovga vaqtida javob bermadi (Timeout).")
+    except Exception as exc:
+        raise AIServiceError(f"AI jarayonida xato: {str(exc)}")
+
 
 def analyze_answer(question: str, answer: str, context: str = "") -> str:
     raw_output = run_rag_mistral(question, answer, context)

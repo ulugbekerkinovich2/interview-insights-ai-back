@@ -707,6 +707,15 @@ def analyze_answer_api(question: str, answer: str):
     except logic.AIServiceError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"analysis": analysis}
+    
+@app.post("/logic/ask/")
+def ask_mistral_api(prompt: str):
+    try:
+        response = logic.ask_mistral_raw(prompt)
+    except logic.AIServiceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"response": response}
+
 
 @app.post("/logic/summary/")
 def generate_summary_api(candidate_id: int, db: Session = Depends(get_db)):

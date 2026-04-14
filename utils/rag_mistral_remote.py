@@ -81,6 +81,8 @@ def main():
     parser.add_argument("--question", default="")
     parser.add_argument("--answer", default="")
     parser.add_argument("--context", default="")
+    parser.add_argument("--prompt", default="")
+
     args = parser.parse_args()
 
     question_text = args.question.strip() or os.getenv("UI_HR_QUESTION", "").strip()
@@ -100,7 +102,12 @@ def main():
     print("=" * 80)
     print(candidate_answer)
 
-    prompt = build_prompt(candidate_answer, question_text=question_text, company_context=company_context)
+    prompt = ""
+    if args.prompt:
+        prompt = args.prompt.strip()
+    elif candidate_answer:
+        prompt = build_prompt(candidate_answer, question_text=question_text, company_context=company_context)
+
 
     try:
         answer = ask_mistral(prompt)
