@@ -692,8 +692,8 @@ async def transcribe_audio_api(file: UploadFile = File(...)):
         tmp_path = tmp.name
     
     try:
-        text = logic.transcribe_audio(tmp_path)
-        return {"text": text}
+        text, elapsed_ms = logic.transcribe_audio(tmp_path)
+        return {"text": text, "elapsed_ms": elapsed_ms}
     except logic.TranscriptionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
@@ -758,7 +758,7 @@ async def process_turn_api(
 
     # Step 1: FAST — Whisper transcription only (return immediately)
     try:
-        transcript = logic.transcribe_audio(str(save_path))
+        transcript, stt_ms = logic.transcribe_audio(str(save_path))
     except logic.TranscriptionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -771,6 +771,7 @@ async def process_turn_api(
         "voice_raw": "",
         "candidate_raw": "",
         "audio_url": f"/media/audio/{audio_filename}",
+        "stt_ms": stt_ms,
     }
     answers = list(candidate.answers or [])
     turn_index = len(answers)

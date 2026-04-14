@@ -34,7 +34,8 @@ def load_whisper_model():
         _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
     return _whisper_model
 
-def transcribe_audio(audio_path: str) -> str:
+def transcribe_audio(audio_path: str):
+    """Returns transcript text. Also sets .elapsed_ms attribute on the returned string."""
     if not os.path.exists(audio_path):
         raise TranscriptionError("Audio file not found")
 
@@ -54,6 +55,8 @@ def transcribe_audio(audio_path: str) -> str:
                 parts.append(text)
         return " ".join(parts).strip()
 
+    import time
+    t0 = time.time()
     try:
         transcript = _run_transcription(audio_path)
     except Exception as exc:
@@ -82,10 +85,13 @@ def transcribe_audio(audio_path: str) -> str:
         else:
             raise TranscriptionError(f"Transcription failed: {exc}") from exc
 
+    elapsed_ms = int((time.time() - t0) * 1000)
+    logger.info(f"Whisper STT: {elapsed_ms}ms | {len(transcript)} chars")
+
     if not transcript:
         raise TranscriptionError("Transcription produced no text")
 
-    return transcript
+    return transcript, elapsed_ms
 
 def run_rag_mistral(question: str, answer: str, context: str = ""):
     rag_script_path = os.path.join(PROJECT_DIR, "utils", "rag_mistral_remote.py")
@@ -254,7 +260,7 @@ def process_interview_turn(audio_path: str, question_text: str, db: Session = No
         company_context = ctx_setting.value if ctx_setting else ""
 
     # 2. Transcribe
-    transcript = transcribe_audio(audio_path)
+    transcript, _ = transcribe_audio(audio_path)
 
     # Temporary files for profilers
     transcript_tmp = audio_path + ".txt"
