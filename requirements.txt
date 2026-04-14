@@ -13,6 +13,7 @@ python-multipart==0.0.6
 tokenizers==0.15.2
 faster-whisper
 librosa
+soundfile
 websockets
 alembic==1.12.1
 psycopg2-binary==2.9.9
