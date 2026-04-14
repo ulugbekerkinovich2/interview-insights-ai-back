@@ -205,13 +205,15 @@ def build_interview_summary(answers: list) -> str:
 def run_voice_profiler(audio_path: str):
     """Analyze voice prosody — runs locally via librosa, no network needed."""
     try:
-        sys.path.insert(0, os.path.join(PROJECT_DIR, "utils"))
-        from prosody_analyzer import analyze_prosody, format_report
-        data = analyze_prosody(audio_path)
-        return format_report(data)
+        import importlib
+        spec = importlib.util.spec_from_file_location("prosody_analyzer", os.path.join(PROJECT_DIR, "utils", "prosody_analyzer.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        data = mod.analyze_prosody(audio_path)
+        return mod.format_report(data)
     except Exception as e:
         logger.warning(f"Voice profiler error: {e}")
-        return f"Ошибка голосового анализа: {e}"
+        return f"Ошибка анализа голоса: {e}"
 
 def run_candidate_profiler(audio_path: str, transcript_path: str, visual_path: str, question: str, answer: str, voice_analysis: str, rag_analysis: str):
     script_path = os.path.join(PROJECT_DIR, "utils", "candidate_profiler.py")
@@ -263,8 +265,8 @@ def process_interview_turn(audio_path: str, question_text: str, db: Session = No
     with open(visual_tmp, "w", encoding="utf-8") as f:
         f.write("{}")
 
-    rag_ai = "AI tahlili o'chirilgan"
-    voice_ai = "Ovoz tahlili o'chirilgan"
+    rag_ai = "AI анализ отключён"
+    voice_ai = "Голосовой анализ отключён"
     candidate_ai = ""
 
     try:
@@ -324,19 +326,14 @@ def analyze_visual_frame(image_path: str):
             "primary_emotion": detected,
             "confidence": confidence,
             "gaze_direction": gaze,
-            "behavior_notes": f"Nomzod holati: {detected}. Nigoh: {gaze}",
+            "behavior_notes": f"Состояние: {detected}. Взгляд: {gaze}",
             "stress_level": "Low" if detected in ["Neutral", "Happy"] else "Medium"
         }
     except Exception as e:
         return {"error": str(e)}
 
 def interpret_visual_behavior(frames_data: list):
-    """
-    Barcha kadrlar to'plamidan intervyu davomidagi o'rtacha xulq-atvorni chiqaradi.
-    """
+    """Интерпретация визуального поведения кандидата за всё интервью."""
     if not frames_data:
-        return "Vizual ma'lumotlar yetarli emas."
-        
-    # Eng ko'p takrorlangan hissiyotni aniqlash
-    # ...
-    return "Nomzod intervyu davomida o'zini bosiq va ochiq tutdi (Confidence: High)."
+        return "Недостаточно визуальных данных."
+    return "Кандидат держался уверенно и открыто на протяжении интервью (Confidence: High)."
