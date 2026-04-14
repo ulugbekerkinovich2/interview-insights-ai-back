@@ -52,14 +52,16 @@ def _convert_to_wav(audio_path: str) -> str:
         return audio_path  # no ffmpeg, let whisper handle it
     wav_path = audio_path + ".16k.wav"
     try:
-        subprocess.run(
+        result = subprocess.run(
             [ffmpeg_bin, "-y", "-i", audio_path, "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", wav_path],
             capture_output=True, text=True, timeout=15,
         )
         if os.path.exists(wav_path) and os.path.getsize(wav_path) > 100:
+            logger.info(f"Audio converted: {ext} → wav ({os.path.getsize(wav_path)} bytes)")
             return wav_path
-    except Exception:
-        pass
+        logger.warning(f"WAV conversion failed: {result.stderr[:200]}")
+    except Exception as e:
+        logger.warning(f"WAV conversion error: {e}")
     return audio_path
 
 def transcribe_audio(audio_path: str):
