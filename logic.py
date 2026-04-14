@@ -1,9 +1,12 @@
 import os
 import sys
 import json
+import logging
 import subprocess
 import tempfile
 import shutil
+
+logger = logging.getLogger(__name__)
 from pathlib import Path
 from faster_whisper import WhisperModel
 from sqlalchemy.orm import Session
