@@ -632,18 +632,58 @@ def update_candidate(candidate_id: int, candidate: schemas.CandidateCreate, db: 
 def get_chat_history(db: Session = Depends(get_db)):
     return db.query(ChatMessage).order_by(ChatMessage.id.asc()).all()
 
-@app.post("/chat/", response_model=schemas.ChatMessageSchema)
+@app.post("/chat/")
 def add_chat_message(msg: schemas.ChatMessageCreate, db: Session = Depends(get_db)):
-    import datetime
+    import datetime as dt
+    import threading
+
+    # Save user message
     db_msg = ChatMessage(
         role=msg.role,
         content=msg.content,
-        timestamp=datetime.datetime.now().isoformat()
+        timestamp=dt.datetime.now().isoformat()
     )
     db.add(db_msg)
     db.commit()
     db.refresh(db_msg)
-    return db_msg
+
+    user_msg = {"id": db_msg.id, "role": db_msg.role, "content": db_msg.content, "timestamp": db_msg.timestamp}
+
+    # If user message, generate AI response in background
+    if msg.role == "user":
+        def generate_ai_reply():
+            ai_db = SessionLocal()
+            try:
+                # Build context from recent messages
+                recent = ai_db.query(ChatMessage).order_by(ChatMessage.id.desc()).limit(10).all()
+                context = "\n".join([f"{m.role}: {m.content}" for m in reversed(recent)])
+
+                # Get AI response via Mistral
+                try:
+                    ai_text = logic.analyze_answer(
+                        question=msg.content,
+                        answer=context,
+                        context="Ты — AI-ассистент психолога-методолога. Отвечай на русском языке. Анализируй поведение кандидатов, давай рекомендации по методологии интервью."
+                    )
+                except Exception:
+                    ai_text = "AI сервер временно недоступен. Попробуйте позже."
+
+                ai_msg = ChatMessage(
+                    role="assistant",
+                    content=ai_text,
+                    timestamp=dt.datetime.now().isoformat()
+                )
+                ai_db.add(ai_msg)
+                ai_db.commit()
+            except Exception as e:
+                logger.error(f"AI chat reply failed: {e}")
+            finally:
+                ai_db.close()
+
+        thread = threading.Thread(target=generate_ai_reply, daemon=True)
+        thread.start()
+
+    return user_msg
 
 
 @app.delete("/chat/")
