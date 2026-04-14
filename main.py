@@ -759,11 +759,18 @@ async def process_turn_api(
     with open(save_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Step 1: FAST — Whisper transcription only (return immediately)
+    # Step 1: FAST — Whisper transcription + voice prosody (both local, no network)
     try:
         transcript, stt_ms = logic.transcribe_audio(str(save_path))
     except logic.TranscriptionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Voice analysis (local librosa — fast, no AI server needed)
+    voice_raw = ""
+    try:
+        voice_raw = logic.run_voice_profiler(str(save_path))
+    except Exception as e:
+        logger.warning(f"Voice profiling failed: {e}")
 
     # Save basic answer to DB immediately
     basic_result = {
@@ -771,7 +778,7 @@ async def process_turn_api(
         "answer": transcript,
         "ai": "",
         "next_suggestion": "",
-        "voice_raw": "",
+        "voice_raw": voice_raw,
         "candidate_raw": "",
         "audio_url": f"/media/audio/{audio_filename}",
         "stt_ms": stt_ms,
