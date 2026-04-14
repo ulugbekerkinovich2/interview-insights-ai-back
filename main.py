@@ -717,7 +717,7 @@ def set_setting(setting: schemas.GlobalSettingBase, db: Session = Depends(get_db
 # --- Logic Endpoints (AI) ---
 
 @app.post("/logic/transcribe/")
-async def transcribe_audio_api(file: UploadFile = File(...)):
+def transcribe_audio_api(file: UploadFile = File(...)):
     ext = os.path.splitext(file.filename or "")[1]
     if not ext:
         # Fallback by content-type
@@ -733,7 +733,7 @@ async def transcribe_audio_api(file: UploadFile = File(...)):
         tmp_path = tmp.name
     
     try:
-        text, elapsed_ms = await asyncio.to_thread(logic.transcribe_audio, tmp_path)
+        text, elapsed_ms = logic.transcribe_audio(tmp_path)
         return {"text": text, "elapsed_ms": elapsed_ms}
     except logic.TranscriptionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -745,28 +745,28 @@ async def transcribe_audio_api(file: UploadFile = File(...)):
             os.remove(tmp_path)
 
 @app.post("/logic/analyze/")
-async def analyze_answer_api(question: str, answer: str):
+def analyze_answer_api(question: str, answer: str):
     try:
-        analysis = await asyncio.to_thread(logic.analyze_answer, question, answer)
+        analysis = logic.analyze_answer(question, answer)
     except logic.AIServiceError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"analysis": analysis}
 
 @app.post("/logic/ask/")
-async def ask_mistral_api(prompt: str):
+def ask_mistral_api(prompt: str):
     try:
-        response = await asyncio.to_thread(logic.ask_mistral_raw, prompt)
+        response = logic.ask_mistral_raw(prompt)
     except logic.AIServiceError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"response": response}
 
 
 @app.post("/logic/summary/")
-async def generate_summary_api(candidate_id: int, db: Session = Depends(get_db)):
+def generate_summary_api(candidate_id: int, db: Session = Depends(get_db)):
     candidate = get_candidate_or_404(db, candidate_id)
 
     try:
-        summary = await asyncio.to_thread(logic.build_interview_summary, candidate.answers)
+        summary = logic.build_interview_summary(candidate.answers)
     except logic.AIServiceError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     candidate.summary = summary
@@ -800,22 +800,18 @@ async def process_turn_api(
     with open(save_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Step 1: FAST — Whisper + voice prosody in parallel threads (non-blocking)
+    # Step 1: FAST — Whisper transcription + voice prosody
     audio_path = str(save_path)
     try:
-        stt_task = asyncio.to_thread(logic.transcribe_audio, audio_path)
-        voice_task = asyncio.to_thread(logic.run_voice_profiler, audio_path)
-        (transcript, stt_ms), voice_raw = await asyncio.gather(stt_task, voice_task, return_exceptions=False)
+        transcript, stt_ms = logic.transcribe_audio(audio_path)
     except logic.TranscriptionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        # Voice failed but transcript might have succeeded
-        logger.warning(f"process-turn parallel error: {exc}")
-        try:
-            transcript, stt_ms = await asyncio.to_thread(logic.transcribe_audio, audio_path)
-            voice_raw = ""
-        except logic.TranscriptionError as te:
-            raise HTTPException(status_code=400, detail=str(te)) from te
+
+    voice_raw = ""
+    try:
+        voice_raw = logic.run_voice_profiler(audio_path)
+    except Exception as e:
+        logger.warning(f"Voice profiling failed: {e}")
 
     # Save basic answer to DB immediately
     basic_result = {
@@ -920,7 +916,7 @@ async def analyze_frame_api(candidate_id: int, file: UploadFile = File(...), db:
     tmp_path = frame_save_path
     
     try:
-        res = await asyncio.to_thread(logic.analyze_visual_frame, str(tmp_path)) or {}
+        res = logic.analyze_visual_frame(str(tmp_path)) or {}
         if not isinstance(res, dict):
             res = {}
 
