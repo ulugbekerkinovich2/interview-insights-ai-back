@@ -707,7 +707,7 @@ def clear_chat_history(db: Session = Depends(get_db)):
 # --- Settings Endpoints ---
 
 @app.get("/settings/{key}", response_model=schemas.GlobalSettingSchema)
-def get_setting(key: str, db: Session = Depends(get_db), _: database.User = Depends(require_role(["SuperAdmin", "Recruiter", "Psychologist"]))):
+def get_setting(key: str, db: Session = Depends(get_db)):
     setting = db.query(GlobalSetting).filter(GlobalSetting.key == key).first()
     if setting is None:
         raise HTTPException(status_code=404, detail="Setting not found")
