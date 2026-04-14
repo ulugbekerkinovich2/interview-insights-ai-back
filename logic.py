@@ -203,25 +203,15 @@ def build_interview_summary(answers: list) -> str:
     return extract_mistral_answer(raw_output)
 
 def run_voice_profiler(audio_path: str):
-    script_path = os.path.join(PROJECT_DIR, "utils", "voice_profiler_test.py")
-    prosody_script = os.path.join(PROJECT_DIR, "utils", "prosody_analyzer.py")
-    
-    combined_notes = []
-    
+    """Analyze voice prosody — runs locally via librosa, no network needed."""
     try:
-        # 1. Basic Voice Profiler
-        if os.path.exists(script_path):
-            res1 = subprocess.run([sys.executable, script_path, audio_path], capture_output=True, text=True)
-            combined_notes.append(res1.stdout.strip())
-            
-        # 2. Advanced Prosody Analysis
-        if os.path.exists(prosody_script):
-            res2 = subprocess.run([sys.executable, prosody_script, audio_path], capture_output=True, text=True)
-            combined_notes.append(f"Prosody: {res2.stdout.strip()}")
+        sys.path.insert(0, os.path.join(PROJECT_DIR, "utils"))
+        from prosody_analyzer import analyze_prosody, format_report
+        data = analyze_prosody(audio_path)
+        return format_report(data)
     except Exception as e:
-        combined_notes.append(f"Analysis error: {e}")
-        
-    return " | ".join(combined_notes)
+        logger.warning(f"Voice profiler error: {e}")
+        return f"Ошибка голосового анализа: {e}"
 
 def run_candidate_profiler(audio_path: str, transcript_path: str, visual_path: str, question: str, answer: str, voice_analysis: str, rag_analysis: str):
     script_path = os.path.join(PROJECT_DIR, "utils", "candidate_profiler.py")
