@@ -151,14 +151,17 @@ class WebRTCRoom:
         q.clear()
         return out
 
+import threading
 webrtc_rooms: Dict[int, WebRTCRoom] = {}
+_rooms_lock = threading.Lock()
 
 def _get_room(candidate_id: int) -> WebRTCRoom:
-    room = webrtc_rooms.get(candidate_id)
-    if room is None:
-        room = WebRTCRoom()
-        webrtc_rooms[candidate_id] = room
-    return room
+    with _rooms_lock:
+        room = webrtc_rooms.get(candidate_id)
+        if room is None:
+            room = WebRTCRoom()
+            webrtc_rooms[candidate_id] = room
+        return room
 
 def create_candidate_token(candidate_id: int, expires_minutes: int = 60 * 24) -> str:
     return create_access_token(
@@ -704,14 +707,14 @@ def clear_chat_history(db: Session = Depends(get_db)):
 # --- Settings Endpoints ---
 
 @app.get("/settings/{key}", response_model=schemas.GlobalSettingSchema)
-def get_setting(key: str, db: Session = Depends(get_db)):
+def get_setting(key: str, db: Session = Depends(get_db), _: database.User = Depends(require_role(["SuperAdmin", "Recruiter", "Psychologist"]))):
     setting = db.query(GlobalSetting).filter(GlobalSetting.key == key).first()
     if setting is None:
         raise HTTPException(status_code=404, detail="Setting not found")
     return setting
 
 @app.post("/settings/", response_model=schemas.GlobalSettingSchema)
-def set_setting(setting: schemas.GlobalSettingBase, db: Session = Depends(get_db)):
+def set_setting(setting: schemas.GlobalSettingBase, db: Session = Depends(get_db), _: database.User = Depends(require_role(["SuperAdmin", "Recruiter"]))):
     db_setting = db.query(GlobalSetting).filter(GlobalSetting.key == setting.key).first()
     if db_setting:
         db_setting.value = setting.value
@@ -858,6 +861,7 @@ def process_turn_api(
                     analysis_db.commit()
 
             # Push to admin via WebSocket
+            loop = None
             try:
                 loop = asyncio.new_event_loop()
                 loop.run_until_complete(manager.broadcast({
@@ -872,9 +876,10 @@ def process_turn_api(
                     "candidate_raw": ai_result.get("candidate_raw"),
                     "timestamp": datetime.datetime.utcnow().isoformat(),
                 }))
-                loop.close()
             except Exception as ws_err:
                 logger.warning(f"WebSocket broadcast failed: {ws_err}")
+            finally:
+                if loop: loop.close()
 
             # Telegram notification
             safe_answer = ai_result.get('answer', '')[:100] + "..."
@@ -1082,7 +1087,7 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
             logger.info(f"[WebRTC] Room {candidate_id}: Replacing existing admin connection")
             try:
                 await room.admin.close()
-            except:
+            except Exception:
                 pass
         room.admin = websocket
     else:
@@ -1090,7 +1095,7 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
             logger.info(f"[WebRTC] Room {candidate_id}: Replacing existing candidate connection")
             try:
                 await room.candidate.close()
-            except:
+            except Exception:
                 pass
         room.candidate = websocket
 

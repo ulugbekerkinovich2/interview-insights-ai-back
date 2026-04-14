@@ -30,11 +30,16 @@ class TranscriptionError(LogicError):
 class AIServiceError(LogicError):
     pass
 
+import threading
+_whisper_lock = threading.Lock()
+
 def load_whisper_model():
     global _whisper_model
-    if _whisper_model is None:
-        # Using base or small for faster inference on CPU
-        _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    if _whisper_model is not None:
+        return _whisper_model
+    with _whisper_lock:
+        if _whisper_model is None:
+            _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
     return _whisper_model
 
 def transcribe_audio(audio_path: str):
@@ -128,7 +133,7 @@ def run_rag_mistral(question: str, answer: str, context: str = ""):
             timeout=45, 
         )
     except subprocess.TimeoutExpired:
-        raise AIServiceError("AI tahlil serveri so'rovga vaqtida javob bermadi (Timeout). Iltimos VPN yoki server ulanishini tekshiring.")
+        raise AIServiceError("AI сервер не ответил вовремя (Timeout). Проверьте VPN или подключение к серверу.")
     except Exception as exc:
         raise AIServiceError(f"AI jarayonida kutilmagan xato: {str(exc)}")
 
@@ -175,7 +180,7 @@ def ask_mistral_raw(prompt: str) -> str:
         
         return extract_mistral_answer(result.stdout.strip())
     except subprocess.TimeoutExpired:
-        raise AIServiceError("AI tahlil serveri so'rovga vaqtida javob bermadi (Timeout).")
+        raise AIServiceError("AI сервер не ответил (Timeout).")
     except Exception as exc:
         raise AIServiceError(f"AI jarayonida xato: {str(exc)}")
 
@@ -307,7 +312,7 @@ def process_interview_turn(audio_path: str, question_text: str, db: Session = No
 
 def analyze_visual_frame(image_path: str):
     """
-    Yuzdagi hissiyotlarni tahlil qilish (DeepFace asosida).
+    Анализ эмоций на лице (на основе DeepFace).
     Agar kutubxona o'rnatilmagan bo'lsa, mantiqiy model strukturasini qaytaradi.
     """
     try:
