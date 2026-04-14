@@ -841,66 +841,43 @@ def process_turn_api(
     candidate.answers = answers
     db.commit()
 
-    # Step 2: BACKGROUND — AI analysis in a separate thread (non-blocking)
+    # Step 2: BACKGROUND — AI analysis only (no Whisper again)
     import threading
-    import asyncio
 
     def run_ai_analysis():
         analysis_db = SessionLocal()
         try:
-            ai_result = logic.process_interview_turn(str(save_path), question, db=analysis_db)
-            ai_result["audio_url"] = f"/media/audio/{audio_filename}"
+            # Only RAG analysis — skip Whisper (already done above)
+            rag_ai = ""
+            try:
+                rag_ai = logic.analyze_answer(question, transcript)
+            except Exception:
+                rag_ai = "AI анализ недоступен"
 
-            # Update candidate answers with full AI result
+            # Update candidate answers with AI result
+            full_result = basic_result.copy()
+            full_result["ai"] = rag_ai
+
             cand = analysis_db.query(database.Candidate).filter_by(id=candidate_id).first()
             if cand:
                 ans = list(cand.answers or [])
                 if turn_index < len(ans):
-                    ans[turn_index] = ai_result.copy()
+                    ans[turn_index] = full_result.copy()
                     cand.answers = ans
                     analysis_db.commit()
 
-            # Push to admin via WebSocket
-            loop = None
-            try:
-                loop = asyncio.new_event_loop()
-                loop.run_until_complete(manager.broadcast({
-                    "type": "TURN_RESULT",
-                    "candidate_id": candidate_id,
-                    "question": ai_result.get("question"),
-                    "answer": ai_result.get("answer"),
-                    "ai": ai_result.get("ai"),
-                    "next_suggestion": ai_result.get("next_suggestion"),
-                    "audio_url": ai_result.get("audio_url"),
-                    "voice_raw": ai_result.get("voice_raw"),
-                    "candidate_raw": ai_result.get("candidate_raw"),
-                    "timestamp": datetime.datetime.utcnow().isoformat(),
-                }))
-            except Exception as ws_err:
-                logger.warning(f"WebSocket broadcast failed: {ws_err}")
-            finally:
-                if loop: loop.close()
-
-            # Telegram notification
-            safe_answer = ai_result.get('answer', '')[:100] + "..."
-            next_q = ai_result.get('next_suggestion', 'Не определено')
-            msg = (
-                f"📝 <b>Ответ проанализирован</b>\n\n"
-                f"❓ Вопрос: {question}\n"
-                f"💬 Ответ: {safe_answer}\n"
-                f"🧠 AI: {ai_result.get('ai', '')[:150]}...\n\n"
-                f"✨ <b>Рекомендуемый вопрос:</b>\n<i>{next_q}</i>"
+            # Telegram
+            send_telegram_notification(
+                f"📝 <b>Ответ проанализирован</b>\n❓ {question}\n💬 {transcript[:100]}...\n🧠 {rag_ai[:150]}"
             )
-            send_telegram_notification(msg)
         except Exception as e:
-            logger.error(f"Background AI analysis failed for candidate {candidate_id}: {e}")
+            logger.error(f"Background AI failed: {e}")
         finally:
             analysis_db.close()
 
     thread = threading.Thread(target=run_ai_analysis, daemon=True)
     thread.start()
 
-    # Return fast response (transcript only, AI pending)
     return basic_result
 
 # Helper to validate password strength
