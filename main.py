@@ -792,7 +792,13 @@ def process_turn_api(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    candidate = get_candidate_or_404(db, candidate_id)
+    try:
+        candidate = get_candidate_or_404(db, candidate_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"process-turn candidate lookup failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
     # Create permanent audio storage path
     ext = os.path.splitext(file.filename or "")[1]
@@ -839,7 +845,11 @@ def process_turn_api(
     turn_index = len(answers)
     answers.append(basic_result.copy())
     candidate.answers = answers
-    db.commit()
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"DB commit failed in process-turn: {e}")
 
     # Step 2: BACKGROUND — AI analysis only (no Whisper again)
     import threading
@@ -875,8 +885,11 @@ def process_turn_api(
         finally:
             analysis_db.close()
 
-    thread = threading.Thread(target=run_ai_analysis, daemon=True)
-    thread.start()
+    try:
+        thread = threading.Thread(target=run_ai_analysis, daemon=True)
+        thread.start()
+    except Exception as e:
+        logger.error(f"Failed to start AI thread: {e}")
 
     return basic_result
 
