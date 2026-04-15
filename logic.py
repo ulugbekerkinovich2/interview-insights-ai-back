@@ -73,11 +73,6 @@ def transcribe_audio(audio_path: str):
             path,
             beam_size=1,
             vad_filter=True,
-            vad_parameters=dict(
-                min_silence_duration_ms=1000,  # Allow up to 1s pauses inside speech
-                speech_pad_ms=400,  # Pad speech segments by 400ms
-                threshold=0.35,  # Lower threshold = more sensitive to quiet speech
-            ),
             condition_on_previous_text=False,
             language="ru",
         )
