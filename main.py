@@ -730,7 +730,7 @@ def set_setting(setting: schemas.GlobalSettingBase, db: Session = Depends(get_db
 # --- Logic Endpoints (AI) ---
 
 @app.post("/logic/transcribe/")
-def transcribe_audio_api(file: UploadFile = File(...)):
+def transcribe_audio_api(file: UploadFile = File(...), save: bool = False):
     ext = os.path.splitext(file.filename or "")[1]
     if not ext:
         # Fallback by content-type
@@ -741,20 +741,41 @@ def transcribe_audio_api(file: UploadFile = File(...)):
         else:
             ext = ".wav"
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = tmp.name
-    
+    # Save audio permanently if requested, otherwise use temp file
+    audio_url = None
+    if save:
+        audio_filename = f"{secrets.token_hex(16)}{ext}"
+        save_path = MEDIA_AUDIO_DIR / audio_filename
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(save_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        tmp_path = str(save_path)
+        audio_url = f"/media/audio/{audio_filename}"
+    else:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            shutil.copyfileobj(file.file, tmp)
+            tmp_path = tmp.name
+
     try:
         text, elapsed_ms = logic.transcribe_audio(tmp_path)
-        return {"text": text, "elapsed_ms": elapsed_ms}
+        result = {"text": text, "elapsed_ms": elapsed_ms}
+        if audio_url:
+            result["audio_url"] = audio_url
+        return result
     except logic.TranscriptionError as exc:
+        # Even if transcription fails, return audio_url so user can re-listen
+        if audio_url:
+            raise HTTPException(
+                status_code=400,
+                detail={"message": str(exc), "audio_url": audio_url},
+            )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.error(f"Transcription unexpected error: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"STT error: {exc}") from exc
     finally:
-        if os.path.exists(tmp_path):
+        # Only delete temp files, not permanently saved ones
+        if not save and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
 @app.post("/logic/analyze/")
