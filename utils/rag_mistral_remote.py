@@ -32,30 +32,30 @@ def read_transcript_text(transcript_path):
 
 
 def build_prompt(candidate_answer, question_text="", company_context=""):
-    question_block = f"\nHR tomonidan berilgan savol:\n{question_text}\n" if question_text else ""
-    context_block = f"\nKOMPANIYA TALABLARI VA KONTEKST:\n{company_context}\n" if company_context else ""
+    question_block = f"\nВопрос HR:\n{question_text}\n" if question_text else ""
+    context_block = f"\nТРЕБОВАНИЯ КОМПАНИИ И КОНТЕКСТ:\n{company_context}\n" if company_context else ""
 
     prompt = f"""
-Siz professional psixolog va AI-intervyuer profraylersiz.
+Вы — профессиональный психолог и AI-интервьюер-профайлер.
 
-Vazifangiz: Nomzodning javobini tahlil qilish.
+Ваша задача: проанализировать ответ кандидата.
 {context_block}
 
-Ma'lumotlar:
+Данные:
 {question_block}
-Nomzodning javobi:
+Ответ кандидата:
 {candidate_answer}
 
-TAHLILNI QUYIDAGI FORMATDA (O'ZBEK TILIDA) QAYTARIN:
+ВЕРНИТЕ АНАЛИЗ В СЛЕДУЮЩЕМ ФОРМАТЕ (НА РУССКОМ ЯЗЫКЕ):
 
-1. UMUMIY XULOSA: Javobning mohiyati va nomzodning o'ziga bo'lgan ishonchi.
-2. KOMPANIYAGA MOSLIK (FIT SCORE): Nomzod qanchalik mos keladi (0-100).
-3. PSIXOLOGIK JIHATLAR: Javobdan qochish, mavhumlik yoki hayajon belgilari.
-4. NAVBATDAGI STRATEGIK SAVOL: Nomzodning zaif nuqtalarini aniqlash uchun KEYINGI SAVOLNI TAVSIYA QILING.
+1. ОБЩИЙ ВЫВОД: Суть ответа и уровень уверенности кандидата в себе.
+2. СООТВЕТСТВИЕ КОМПАНИИ (FIT SCORE): Насколько кандидат подходит (0-100).
+3. ПСИХОЛОГИЧЕСКИЕ АСПЕКТЫ: Уклонение от ответа, абстрактность или признаки волнения.
+4. СЛЕДУЮЩИЙ СТРАТЕГИЧЕСКИЙ ВОПРОС: Предложите следующий вопрос для выявления слабых сторон кандидата.
 
-ESLATMA:
-- JAVOBNI FAQAT O'ZBEK TILIDA YOZING.
-- MUSTAQIL SAVOL BO'LIMINI "NAVBATDAGI SAVOL:" belgisidan so'ng yozing.
+ВАЖНО:
+- ПИШИТЕ ОТВЕТ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ.
+- РАЗДЕЛ ВОПРОСА ПИШИТЕ ПОСЛЕ МЕТКИ "СЛЕДУЮЩИЙ ВОПРОС:".
 """.strip()
 
     return prompt
