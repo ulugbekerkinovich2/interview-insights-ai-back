@@ -64,8 +64,8 @@ def transcribe_audio(audio_path: str):
     if not os.path.exists(audio_path):
         raise TranscriptionError("Audio file not found")
 
-    # Trim to max 15s — prevents 2min+ processing on slow CPU
-    trimmed_path = _trim_audio(audio_path, max_seconds=15)
+    # Trim to max 30s — allows pauses in HR questions
+    trimmed_path = _trim_audio(audio_path, max_seconds=30)
 
     def _run_transcription(path: str) -> str:
         model = load_whisper_model()
