@@ -370,6 +370,34 @@ def get_protected_frame(
     from fastapi.responses import FileResponse
     return FileResponse(file_path)
 
+@app.get("/media/audio/{filename}")
+def get_protected_audio(
+    filename: str,
+    token: Optional[str] = None,
+    authorization: Optional[str] = Header(default=None),
+):
+    jwt_token = token or _extract_bearer_token(authorization)
+    if not jwt_token:
+        raise HTTPException(status_code=401, detail="Audio faylga kirish uchun tizimga kiring")
+
+    try:
+        payload = jwt.decode(jwt_token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Noto'g'ri yoki eskirgan token")
+
+    # Allow both admin roles and candidates to access audio
+    role = payload.get("role")
+    if role not in ADMIN_MEDIA_ROLES and role != "Candidate":
+        raise HTTPException(status_code=403, detail="Audio faylga kirish uchun ruxsat yo'q")
+
+    file_path = MEDIA_AUDIO_DIR / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Audio fayl topilmadi")
+    from fastapi.responses import FileResponse
+    media_type = "audio/webm" if filename.endswith(".webm") else "audio/ogg" if filename.endswith(".ogg") else "audio/wav"
+    return FileResponse(file_path, media_type=media_type)
+
+
 @app.get("/health", response_model=schemas.HealthSchema)
 def health_check():
     try:
