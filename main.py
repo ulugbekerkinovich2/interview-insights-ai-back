@@ -1141,23 +1141,18 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
     except Exception as e:
         logger.error(f"[WebRTC] Error flushing buffer for {actor_type}: {e}")
 
-    # Let this side know if peer is already connected.
-    try:
-        if actor_type == "admin" and room.candidate:
-            await websocket.send_json({"type": "candidate_joined"})
-        if actor_type == "candidate" and room.admin:
-            await websocket.send_json({"type": "admin_joined"})
-    except Exception:
-        pass
-
-    # Notify the other side that someone is ready.
+    # Single notification: tell each side about the other (exactly once)
     other = room.other(websocket)
     if other:
         try:
-            logger.info(f"[WebRTC] Notifying peer ({'admin' if actor_type=='candidate' else 'candidate'}) that {actor_type} joined")
+            peer_type = "candidate" if actor_type == "admin" else "admin"
+            # Tell the newcomer that the peer is already here
+            await websocket.send_json({"type": f"{peer_type}_joined"})
+            # Tell the existing peer that the newcomer arrived
             await other.send_json({"type": f"{actor_type}_joined"})
+            logger.info(f"[WebRTC] Notified both sides in room {candidate_id}")
         except Exception as e:
-            logger.error(f"[WebRTC] Failed to notify peer: {e}")
+            logger.error(f"[WebRTC] Join notification failed: {e}")
 
     try:
         while True:
