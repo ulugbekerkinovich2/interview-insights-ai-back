@@ -816,6 +816,46 @@ def transcribe_audio_api(file: UploadFile = File(...), save: bool = False, _: da
             shutil.copyfileobj(file.file, tmp)
             tmp_path = tmp.name
 
+    # If save=true, return immediately and process in background
+    # Frontend will get audio_url now, text via polling later
+    if save and audio_url:
+        task_id = str(uuid.uuid4())
+
+        import threading
+        def background_transcribe():
+            try:
+                text, elapsed_ms = logic.transcribe_audio(tmp_path)
+                # Store result in global settings for polling
+                with SessionLocal() as tdb:
+                    setting = database.GlobalSetting(key=f"stt_result_{task_id}", value={"text": text, "elapsed_ms": elapsed_ms, "audio_url": audio_url, "status": "done"})
+                    tdb.merge(setting)
+                    tdb.commit()
+                # Broadcast to admin via WebSocket
+                try:
+                    loop = asyncio.new_event_loop()
+                    loop.run_until_complete(manager.broadcast({
+                        "type": "STT_RESULT",
+                        "task_id": task_id,
+                        "text": text,
+                        "audio_url": audio_url,
+                        "elapsed_ms": elapsed_ms,
+                    }))
+                    loop.close()
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"Background transcribe failed: {e}")
+                with SessionLocal() as tdb:
+                    setting = database.GlobalSetting(key=f"stt_result_{task_id}", value={"text": "", "error": str(e), "audio_url": audio_url, "status": "error"})
+                    tdb.merge(setting)
+                    tdb.commit()
+
+        thread = threading.Thread(target=background_transcribe, daemon=True)
+        thread.start()
+
+        return {"text": "", "elapsed_ms": 0, "audio_url": audio_url, "task_id": task_id, "status": "processing"}
+
+    # Sync mode (save=false) — wait for result
     try:
         text, elapsed_ms = logic.transcribe_audio(tmp_path)
         result = {"text": text, "elapsed_ms": elapsed_ms}
@@ -823,20 +863,26 @@ def transcribe_audio_api(file: UploadFile = File(...), save: bool = False, _: da
             result["audio_url"] = audio_url
         return result
     except logic.TranscriptionError as exc:
-        # Even if transcription fails, return audio_url so user can re-listen
         if audio_url:
-            raise HTTPException(
-                status_code=400,
-                detail={"message": str(exc), "audio_url": audio_url},
-            )
+            raise HTTPException(status_code=400, detail={"message": str(exc), "audio_url": audio_url})
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
-        logger.error(f"Transcription unexpected error: {exc}", exc_info=True)
+        logger.error(f"Transcription error: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"STT error: {exc}") from exc
     finally:
-        # Only delete temp files, not permanently saved ones
         if not save and os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+@app.get("/logic/stt-result/{task_id}")
+def get_stt_result(task_id: str, db: Session = Depends(get_db)):
+    setting = db.query(GlobalSetting).filter(GlobalSetting.key == f"stt_result_{task_id}").first()
+    if not setting:
+        return {"status": "processing"}
+    result = setting.value
+    # Cleanup after reading
+    db.delete(setting)
+    db.commit()
+    return result
 
 @app.post("/logic/analyze/")
 def analyze_answer_api(question: str, answer: str, _: database.User = Depends(require_admin)):
