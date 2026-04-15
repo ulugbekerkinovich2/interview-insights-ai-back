@@ -100,6 +100,17 @@ class ChatMessage(Base):
     content = Column(Text)
     timestamp = Column(String) # Can be improved to DateTime later
 
+class Notification(Base):
+    __tablename__ = "notifications"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # null = broadcast to all
+    title = Column(String)
+    message = Column(Text)
+    type = Column(String, default="info")  # info, success, warning, error
+    is_read = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
 class GlobalSetting(Base):
     __tablename__ = "global_settings"
     key = Column(String, primary_key=True)

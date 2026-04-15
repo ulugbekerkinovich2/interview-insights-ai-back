@@ -577,6 +577,7 @@ def candidate_login(request: Request, access_code: str = Form(...), pin: str = F
     
     # Notify HR
     send_telegram_notification(f"🚀 <b>Кандидат вошёл в сессию!</b>\n\n👤 {candidate.name}\n🆔 ID: {candidate.id}")
+    create_notification(db, f"Кандидат подключился", f"{candidate.name} (ID: {candidate.id}) вошёл в сессию", "info")
 
     # Notify admin about candidate joining
     try:
@@ -1310,6 +1311,66 @@ def delete_user(user_id: int, db: Session = Depends(get_db), admin: database.Use
     db.delete(user)
     db.commit()
     return {"status": "deleted"}
+
+# --- Notifications ---
+
+@app.get("/notifications/")
+def get_notifications(db: Session = Depends(get_db), user: database.User = Depends(require_admin)):
+    notifs = (
+        db.query(database.Notification)
+        .filter((database.Notification.user_id == user.id) | (database.Notification.user_id.is_(None)))
+        .order_by(database.Notification.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    return [
+        {
+            "id": n.id,
+            "title": n.title,
+            "message": n.message,
+            "type": n.type,
+            "is_read": n.is_read,
+            "created_at": n.created_at.isoformat() if n.created_at else None,
+        }
+        for n in notifs
+    ]
+
+@app.get("/notifications/unread-count")
+def get_unread_count(db: Session = Depends(get_db), user: database.User = Depends(require_admin)):
+    count = (
+        db.query(database.Notification)
+        .filter(
+            (database.Notification.user_id == user.id) | (database.Notification.user_id.is_(None)),
+            database.Notification.is_read == False,
+        )
+        .count()
+    )
+    return {"count": count}
+
+@app.post("/notifications/{notification_id}/read")
+def mark_notification_read(notification_id: int, db: Session = Depends(get_db), user: database.User = Depends(require_admin)):
+    notif = db.query(database.Notification).filter_by(id=notification_id).first()
+    if notif and (notif.user_id == user.id or notif.user_id is None):
+        notif.is_read = True
+        db.commit()
+    return {"status": "ok"}
+
+@app.post("/notifications/read-all")
+def mark_all_read(db: Session = Depends(get_db), user: database.User = Depends(require_admin)):
+    db.query(database.Notification).filter(
+        (database.Notification.user_id == user.id) | (database.Notification.user_id.is_(None)),
+        database.Notification.is_read == False,
+    ).update({"is_read": True}, synchronize_session=False)
+    db.commit()
+    return {"status": "ok"}
+
+
+def create_notification(db_session, title: str, message: str, type: str = "info", user_id: int = None):
+    """Helper to create a notification from anywhere in the backend."""
+    notif = database.Notification(title=title, message=message, type=type, user_id=user_id)
+    db_session.add(notif)
+    db_session.commit()
+
 
 # --- Feature Flags Management ---
 @app.get("/features/", response_model=List[dict])
