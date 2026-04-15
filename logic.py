@@ -143,6 +143,15 @@ def _build_analysis_prompt(question: str, answer: str, context: str = "") -> str
 
 
 def analyze_answer(question: str, answer: str, context: str = "") -> str:
+    # RAG: enrich context with relevant documents from Qdrant
+    try:
+        from utils.rag_service import search_context
+        rag_context = search_context(f"{question} {answer}")
+        if rag_context:
+            context = f"{context}\n\nРЕЛЕВАНТНЫЕ ДОКУМЕНТЫ КОМПАНИИ:\n{rag_context}" if context else rag_context
+    except Exception as e:
+        logger.warning(f"RAG context retrieval failed: {e}")
+
     prompt = _build_analysis_prompt(question, answer, context)
     return _call_ai(prompt)
 

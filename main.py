@@ -1457,6 +1457,58 @@ def create_notification(db_session, title: str, message: str, type: str = "info"
     db_session.commit()
 
 
+# --- RAG / Knowledge Base ---
+
+@app.get("/rag/status")
+def rag_status(_: database.User = Depends(require_admin)):
+    from utils.rag_service import get_collection_info
+    return get_collection_info()
+
+@app.get("/rag/documents")
+def rag_list_documents(_: database.User = Depends(require_admin)):
+    from utils.rag_service import get_all_documents
+    return get_all_documents()
+
+@app.post("/rag/documents")
+def rag_add_document(
+    text: str = Form(...),
+    category: str = Form("general"),
+    _: database.User = Depends(require_role(["SuperAdmin", "Recruiter"])),
+):
+    from utils.rag_service import add_document, ensure_collection
+    ensure_collection()
+    success = add_document(text, metadata={"category": category})
+    if not success:
+        raise HTTPException(status_code=500, detail="Не удалось добавить документ. Проверьте Qdrant настройки.")
+    return {"status": "added"}
+
+@app.post("/rag/documents/bulk")
+def rag_bulk_upload(
+    texts: List[str] = Form(...),
+    category: str = Form("general"),
+    _: database.User = Depends(require_role(["SuperAdmin"])),
+):
+    from utils.rag_service import add_document, ensure_collection
+    ensure_collection()
+    added = 0
+    for text in texts:
+        if text.strip() and add_document(text.strip(), metadata={"category": category}):
+            added += 1
+    return {"status": "ok", "added": added, "total": len(texts)}
+
+@app.delete("/rag/documents/{doc_id}")
+def rag_delete_document(doc_id: str, _: database.User = Depends(require_role(["SuperAdmin"]))):
+    from utils.rag_service import delete_document
+    delete_document(doc_id)
+    return {"status": "deleted"}
+
+@app.post("/rag/search")
+def rag_search(query: str = Form(...), top_k: int = Form(3), _: database.User = Depends(require_admin)):
+    from utils.rag_service import search_context
+    context = search_context(query, top_k=top_k)
+    return {"context": context}
+
+
 # --- Feature Flags Management ---
 @app.get("/features/", response_model=List[dict])
 def get_features(db: Session = Depends(get_db)):
