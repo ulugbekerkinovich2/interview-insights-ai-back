@@ -4,9 +4,7 @@ import argparse
 import requests
 
 from dotenv import load_dotenv
-
 from project_paths import resolve_project_dir
-
 
 PROJECT_DIR = resolve_project_dir(__file__)
 PROJECT_ROOT = os.path.dirname(PROJECT_DIR)
@@ -14,9 +12,14 @@ PROJECT_ROOT = os.path.dirname(PROJECT_DIR)
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 load_dotenv(os.path.join(PROJECT_DIR, ".env"))
 
+# Mistral Cloud API
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
+MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
+
+# Fallback: Ollama local
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
-
 
 DEFAULT_TRANSCRIPT_FILE = os.path.join(PROJECT_DIR, "whisper_output.txt")
 
@@ -24,7 +27,6 @@ DEFAULT_TRANSCRIPT_FILE = os.path.join(PROJECT_DIR, "whisper_output.txt")
 def read_transcript_text(transcript_path):
     if not os.path.exists(transcript_path):
         return ""
-
     with open(transcript_path, "r", encoding="utf-8") as f:
         return f.read().strip()
 
@@ -32,11 +34,11 @@ def read_transcript_text(transcript_path):
 def build_prompt(candidate_answer, question_text="", company_context=""):
     question_block = f"\nHR tomonidan berilgan savol:\n{question_text}\n" if question_text else ""
     context_block = f"\nKOMPANIYA TALABLARI VA KONTEKST:\n{company_context}\n" if company_context else ""
-    
-    prompt = f"""
-Siz professional psixolog va AI-intervyuer profraylersiz. (Professional psychologist and AI profiler).
 
-Vazifangiz: Nomzodning javobini quyidagi kompaniya talablari va kontekst asosida tahlil qilish:
+    prompt = f"""
+Siz professional psixolog va AI-intervyuer profraylersiz.
+
+Vazifangiz: Nomzodning javobini tahlil qilish.
 {context_block}
 
 Ma'lumotlar:
@@ -47,8 +49,8 @@ Nomzodning javobi:
 TAHLILNI QUYIDAGI FORMATDA (O'ZBEK TILIDA) QAYTARIN:
 
 1. UMUMIY XULOSA: Javobning mohiyati va nomzodning o'ziga bo'lgan ishonchi.
-2. KOMPANIYAGA MOSLIK (FIT SCORE): Yuqoridagi kompaniya talablariga nomzod qanchalik mos keladi (0/100).
-3. PSIXOLOGIK JIHATLAR: Javobdan qochish, mavhumlik yoki hayajon belgilari (Ovoz tahlili va kognitiv tushkunlik).
+2. KOMPANIYAGA MOSLIK (FIT SCORE): Nomzod qanchalik mos keladi (0-100).
+3. PSIXOLOGIK JIHATLAR: Javobdan qochish, mavhumlik yoki hayajon belgilari.
 4. NAVBATDAGI STRATEGIK SAVOL: Nomzodning zaif nuqtalarini aniqlash uchun KEYINGI SAVOLNI TAVSIYA QILING.
 
 ESLATMA:
@@ -59,30 +61,51 @@ ESLATMA:
     return prompt
 
 
-def ask_mistral(prompt):
-    url = f"{OLLAMA_BASE_URL}/api/generate"
-
-    data = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False
+def ask_mistral_cloud(prompt):
+    """Call Mistral Cloud API (api.mistral.ai)"""
+    headers = {
+        "Authorization": f"Bearer {MISTRAL_API_KEY}",
+        "Content-Type": "application/json",
     }
+    data = {
+        "model": MISTRAL_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.4,
+        "max_tokens": 1024,
+    }
+    response = requests.post(MISTRAL_API_URL, json=data, headers=headers, timeout=60)
+    response.raise_for_status()
+    payload = response.json()
+    return payload["choices"][0]["message"]["content"].strip()
 
+
+def ask_ollama(prompt):
+    """Fallback: Call local Ollama server"""
+    url = f"{OLLAMA_BASE_URL}/api/generate"
+    data = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
     response = requests.post(url, json=data, timeout=120)
     response.raise_for_status()
+    return response.json().get("response", "").strip()
 
-    payload = response.json()
-    return payload.get("response", "").strip()
+
+def ask_ai(prompt):
+    """Try Mistral Cloud first, fallback to Ollama"""
+    if MISTRAL_API_KEY:
+        try:
+            return ask_mistral_cloud(prompt)
+        except Exception as e:
+            print(f"Mistral Cloud error: {e}", file=sys.stderr)
+    # Fallback to Ollama
+    return ask_ollama(prompt)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run Mistral analysis for interview transcript or direct Q/A text.")
+    parser = argparse.ArgumentParser()
     parser.add_argument("transcript_path", nargs="?", default=None)
     parser.add_argument("--question", default="")
     parser.add_argument("--answer", default="")
     parser.add_argument("--context", default="")
     parser.add_argument("--prompt", default="")
-
     args = parser.parse_args()
 
     question_text = args.question.strip() or os.getenv("UI_HR_QUESTION", "").strip()
@@ -102,18 +125,15 @@ def main():
     print("=" * 80)
     print(candidate_answer)
 
-    prompt = ""
     if args.prompt:
         prompt = args.prompt.strip()
-    elif candidate_answer:
+    else:
         prompt = build_prompt(candidate_answer, question_text=question_text, company_context=company_context)
 
-
     try:
-        answer = ask_mistral(prompt)
+        answer = ask_ai(prompt)
     except Exception as e:
-        print("\nОшибка при обращении к Mistral на МК:")
-        print(e)
+        print(f"\nОшибка AI: {e}")
         return
 
     print("\n" + "=" * 80)
