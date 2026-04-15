@@ -836,11 +836,40 @@ def generate_summary_api(candidate_id: int, db: Session = Depends(get_db)):
     return {"summary": summary}
 
 
+@app.patch("/candidates/{candidate_id}/answers/{turn_uid}")
+def patch_answer_field(
+    candidate_id: int,
+    turn_uid: str,
+    question_audio_url: Optional[str] = Form(None),
+    question: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """Update specific fields of an answer by turn_uid (e.g. question_audio_url after HR STT)."""
+    candidate = get_candidate_or_404(db, candidate_id)
+    answers = list(candidate.answers or [])
+    updated = False
+    for ans in answers:
+        if ans.get("turn_uid") == turn_uid:
+            if question_audio_url is not None:
+                ans["question_audio_url"] = question_audio_url
+            if question is not None:
+                ans["question"] = question
+            updated = True
+            break
+    if not updated:
+        raise HTTPException(status_code=404, detail="Answer not found")
+    candidate.answers = answers
+    flag_modified(candidate, "answers")
+    db.commit()
+    return {"status": "updated"}
+
+
 @app.post("/logic/process-turn/")
 def process_turn_api(
     candidate_id: int = Form(...),
     question: str = Form(...),
     file: UploadFile = File(...),
+    question_audio_url: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
     try:
@@ -892,6 +921,7 @@ def process_turn_api(
         "voice_raw": voice_raw,
         "candidate_raw": "",
         "audio_url": f"/media/audio/{audio_filename}",
+        "question_audio_url": question_audio_url or "",
         "stt_ms": stt_ms,
     }
     answers = list(candidate.answers or [])
