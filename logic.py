@@ -100,7 +100,7 @@ def _call_mistral_cloud(prompt: str) -> str:
     """Direct Mistral Cloud API call — no subprocess overhead."""
     headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
     data = {"model": MISTRAL_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.4, "max_tokens": 1024}
-    resp = http_requests.post(MISTRAL_API_URL, json=data, headers=headers, timeout=60)
+    resp = http_requests.post(MISTRAL_API_URL, json=data, headers=headers, timeout=300)
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"].strip()
 
