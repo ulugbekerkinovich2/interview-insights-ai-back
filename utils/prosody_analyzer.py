@@ -1,6 +1,10 @@
 import sys
+import warnings
 import librosa
 import numpy as np
+
+warnings.filterwarnings("ignore", category=UserWarning, module="librosa")
+warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")
 
 def analyze_prosody(audio_path):
     try:
