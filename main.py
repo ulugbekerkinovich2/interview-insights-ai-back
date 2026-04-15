@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 import asyncio
 import shutil
 import tempfile
@@ -633,7 +634,8 @@ def update_candidate(candidate_id: int, candidate: schemas.CandidateCreate, db: 
     db_candidate.summary = candidate.summary
     db_candidate.status = candidate.status
     db_candidate.answers = candidate.answers
-    
+    flag_modified(db_candidate, "answers")
+
     db.commit()
     db.refresh(db_candidate)
     return db_candidate
@@ -830,8 +832,10 @@ def process_turn_api(
     except Exception as e:
         logger.warning(f"Voice profiling failed: {e}")
 
-    # Save basic answer to DB immediately
+    # Save basic answer to DB immediately with unique turn_uid
+    turn_uid = str(uuid.uuid4())
     basic_result = {
+        "turn_uid": turn_uid,
         "question": question,
         "answer": transcript,
         "ai": "",
@@ -842,9 +846,9 @@ def process_turn_api(
         "stt_ms": stt_ms,
     }
     answers = list(candidate.answers or [])
-    turn_index = len(answers)
     answers.append(basic_result.copy())
     candidate.answers = answers
+    flag_modified(candidate, "answers")
     try:
         db.commit()
     except Exception as e:
@@ -864,17 +868,33 @@ def process_turn_api(
             except Exception:
                 rag_ai = "AI анализ недоступен"
 
-            # Update candidate answers with AI result
-            full_result = basic_result.copy()
-            full_result["ai"] = rag_ai
-
+            # Update the correct answer by matching turn_uid (not index)
             cand = analysis_db.query(database.Candidate).filter_by(id=candidate_id).first()
             if cand:
                 ans = list(cand.answers or [])
-                if turn_index < len(ans):
-                    ans[turn_index] = full_result.copy()
-                    cand.answers = ans
-                    analysis_db.commit()
+                for i, item in enumerate(ans):
+                    if item.get("turn_uid") == turn_uid:
+                        ans[i]["ai"] = rag_ai
+                        break
+                cand.answers = ans
+                flag_modified(cand, "answers")
+                analysis_db.commit()
+
+            # Broadcast AI result to admin via WebSocket
+            try:
+                loop = asyncio.new_event_loop()
+                loop.run_until_complete(manager.broadcast({
+                    "type": "TURN_RESULT",
+                    "candidate_id": candidate_id,
+                    "question": question,
+                    "ai": rag_ai,
+                    "audio_url": basic_result.get("audio_url", ""),
+                    "voice_raw": basic_result.get("voice_raw", ""),
+                    "turn_uid": turn_uid,
+                }))
+                loop.close()
+            except Exception:
+                pass
 
             # Telegram
             send_telegram_notification(
