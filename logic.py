@@ -42,19 +42,21 @@ def load_whisper_model():
             _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
     return _whisper_model
 
-def _trim_audio(audio_path: str, max_seconds: int = 15) -> str:
-    """Trim audio to max_seconds using ffmpeg. Returns trimmed path or original."""
+def _convert_to_wav(audio_path: str) -> str:
+    """Convert audio to WAV format for Whisper. No duration limit."""
+    if audio_path.endswith(".wav"):
+        return audio_path
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
         return audio_path
-    trimmed = audio_path + f".trim{max_seconds}s.wav"
+    wav_path = audio_path + ".converted.wav"
     try:
         subprocess.run(
-            [ffmpeg_bin, "-y", "-i", audio_path, "-t", str(max_seconds), "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", trimmed],
-            capture_output=True, text=True, timeout=10,
+            [ffmpeg_bin, "-y", "-i", audio_path, "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", wav_path],
+            capture_output=True, text=True, timeout=30,
         )
-        if os.path.exists(trimmed) and os.path.getsize(trimmed) > 100:
-            return trimmed
+        if os.path.exists(wav_path) and os.path.getsize(wav_path) > 100:
+            return wav_path
     except Exception:
         pass
     return audio_path
@@ -64,8 +66,8 @@ def transcribe_audio(audio_path: str):
     if not os.path.exists(audio_path):
         raise TranscriptionError("Audio file not found")
 
-    # Trim to max 30s — allows pauses in HR questions
-    trimmed_path = _trim_audio(audio_path, max_seconds=30)
+    # Convert to WAV for Whisper compatibility (no duration limit)
+    trimmed_path = _convert_to_wav(audio_path)
 
     def _run_transcription(path: str) -> str:
         model = load_whisper_model()

@@ -1011,20 +1011,27 @@ def validate_password_strength(password: str):
 
 @app.post("/logic/analyze-frame/")
 def analyze_frame_api(candidate_id: int, file: UploadFile = File(...)):
-    # Lightweight — no file save, no DB, just random simulation
-    import random
-    emotions = ["Neutral", "Happy", "Anxious", "Surprised", "Serious"]
-    detected = random.choice(emotions)
-    stress = "Low" if detected in ("Neutral", "Happy") else "Medium"
-    gaze = random.choices(["Focused", "Looking Away", "Reading"], weights=[0.85, 0.1, 0.05])[0]
+    from utils.face_analyzer import analyze_frame
 
-    res = {
-        "primary_emotion": detected,
-        "stress_level": stress,
-        "gaze_direction": gaze,
-        "behavior_notes": f"Состояние: {detected}. Взгляд: {gaze}",
-    }
-    return res
+    image_bytes = file.file.read()
+    result = analyze_frame(image_bytes)
+
+    # Save visual record to DB if face detected
+    if result.get("face_detected"):
+        try:
+            with SessionLocal() as frame_db:
+                record = database.VisualRecord(
+                    candidate_id=candidate_id,
+                    emotion=result.get("primary_emotion"),
+                    stress_level=result.get("stress_level"),
+                    notes=f"Взгляд: {result.get('gaze_direction', '—')}",
+                )
+                frame_db.add(record)
+                frame_db.commit()
+        except Exception as e:
+            logger.warning(f"Visual record save failed: {e}")
+
+    return result
 
 @app.websocket("/ws/live-analysis/")
 async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = None):
