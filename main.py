@@ -269,11 +269,14 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 def require_role(roles: List[str]):
     def role_checker(user: database.User = Depends(get_current_user)):
         if not user:
-            raise HTTPException(status_code=401, detail="Seans muddati tugagan yoki tizimga kirmaganman")
+            raise HTTPException(status_code=401, detail="Сессия истекла или вы не авторизованы")
         if user.role not in roles and user.role != "SuperAdmin":
-            raise HTTPException(status_code=403, detail="Sizda ushbu amalni bajarish uchun ruxsat yo'q")
+            raise HTTPException(status_code=403, detail="У вас нет прав для выполнения этого действия")
         return user
     return role_checker
+
+# Shortcut: any authenticated admin user
+require_admin = require_role(["SuperAdmin", "Recruiter", "Psychologist"])
 
 
 def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
@@ -427,7 +430,7 @@ def health_check():
 # --- Candidates Endpoints ---
 
 @app.get("/candidates/stats/")
-def get_candidate_stats(db: Session = Depends(get_db)):
+def get_candidate_stats(db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
     candidates = db.query(database.Candidate).all()
     total = len(candidates)
     
@@ -455,7 +458,7 @@ def get_candidate_stats(db: Session = Depends(get_db)):
     }
 
 @app.get("/candidates/", response_model=List[schemas.CandidateSchema])
-def read_candidates(db: Session = Depends(get_db)):
+def read_candidates(db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
     candidates = db.query(Candidate).all()
     return candidates
 
@@ -465,6 +468,7 @@ def read_visual_records(
     limit: int = 200,
     order: str = "asc",
     db: Session = Depends(get_db),
+    _: database.User = Depends(require_admin),
 ):
     get_candidate_or_404(db, candidate_id)
     if limit < 1:
@@ -528,7 +532,7 @@ def read_latest_visual_frame(
     }
 
 @app.get("/candidates/{candidate_id}", response_model=schemas.CandidateSchema)
-def read_candidate(candidate_id: int, db: Session = Depends(get_db)):
+def read_candidate(candidate_id: int, db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
     return get_candidate_or_404(db, candidate_id)
 
 @app.post("/candidates/", response_model=schemas.CandidateCreateResponse)
@@ -655,7 +659,7 @@ def candidate_login_by_token(
     }
 
 @app.put("/candidates/{candidate_id}", response_model=schemas.CandidateSchema)
-def update_candidate(candidate_id: int, candidate: schemas.CandidateCreate, db: Session = Depends(get_db)):
+def update_candidate(candidate_id: int, candidate: schemas.CandidateCreate, db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
     db_candidate = get_candidate_or_404(db, candidate_id)
     
     db_candidate.name = candidate.name
@@ -671,11 +675,11 @@ def update_candidate(candidate_id: int, candidate: schemas.CandidateCreate, db: 
 # --- Chat Endpoints ---
 
 @app.get("/chat/", response_model=List[schemas.ChatMessageSchema])
-def get_chat_history(db: Session = Depends(get_db)):
+def get_chat_history(db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
     return db.query(ChatMessage).order_by(ChatMessage.id.asc()).all()
 
 @app.post("/chat/")
-def add_chat_message(msg: schemas.ChatMessageCreate, db: Session = Depends(get_db)):
+def add_chat_message(msg: schemas.ChatMessageCreate, db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
     import datetime as dt
     import threading
 
@@ -729,7 +733,7 @@ def add_chat_message(msg: schemas.ChatMessageCreate, db: Session = Depends(get_d
 
 
 @app.delete("/chat/")
-def clear_chat_history(db: Session = Depends(get_db)):
+def clear_chat_history(db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
     db.query(ChatMessage).delete()
     db.commit()
     return {"status": "cleared"}
@@ -758,7 +762,7 @@ def set_setting(setting: schemas.GlobalSettingBase, db: Session = Depends(get_db
 # --- Logic Endpoints (AI) ---
 
 @app.post("/logic/transcribe/")
-def transcribe_audio_api(file: UploadFile = File(...), save: bool = False):
+def transcribe_audio_api(file: UploadFile = File(...), save: bool = False, _: database.User = Depends(require_admin)):
     ext = os.path.splitext(file.filename or "")[1]
     if not ext:
         # Fallback by content-type
@@ -807,7 +811,7 @@ def transcribe_audio_api(file: UploadFile = File(...), save: bool = False):
             os.remove(tmp_path)
 
 @app.post("/logic/analyze/")
-def analyze_answer_api(question: str, answer: str):
+def analyze_answer_api(question: str, answer: str, _: database.User = Depends(require_admin)):
     try:
         analysis = logic.analyze_answer(question, answer)
     except logic.AIServiceError as exc:
@@ -815,7 +819,7 @@ def analyze_answer_api(question: str, answer: str):
     return {"analysis": analysis}
 
 @app.post("/logic/ask/")
-def ask_mistral_api(prompt: str):
+def ask_mistral_api(prompt: str, _: database.User = Depends(require_admin)):
     try:
         response = logic.ask_mistral_raw(prompt)
     except logic.AIServiceError as exc:
@@ -824,7 +828,7 @@ def ask_mistral_api(prompt: str):
 
 
 @app.post("/logic/summary/")
-def generate_summary_api(candidate_id: int, db: Session = Depends(get_db)):
+def generate_summary_api(candidate_id: int, db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
     candidate = get_candidate_or_404(db, candidate_id)
 
     try:
@@ -843,6 +847,7 @@ def patch_answer_field(
     question_audio_url: Optional[str] = Form(None),
     question: Optional[str] = Form(None),
     db: Session = Depends(get_db),
+    _: database.User = Depends(require_admin),
 ):
     """Update specific fields of an answer by turn_uid (e.g. question_audio_url after HR STT)."""
     candidate = get_candidate_or_404(db, candidate_id)
@@ -871,6 +876,7 @@ def process_turn_api(
     file: UploadFile = File(...),
     question_audio_url: Optional[str] = Form(None),
     db: Session = Depends(get_db),
+    _: database.User = Depends(require_admin),
 ):
     try:
         candidate = get_candidate_or_404(db, candidate_id)
@@ -1184,15 +1190,20 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
 def login(request: Request, email: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
     user = db.query(database.User).filter(database.User.email == email).first()
     if not user or not verify_password(password, user.password):
-        raise HTTPException(status_code=401, detail="Email yoki parol noto'g'ri")
-    
+        raise HTTPException(status_code=401, detail="Неверный email или пароль")
+
+    # Track login activity
+    user.login_count = (user.login_count or 0) + 1
+    user.last_login = datetime.datetime.utcnow()
+    db.commit()
+
     access_token_expires = datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={"sub": user.email, "role": user.role}, expires_delta=access_token_expires
     )
-    
+
     return {
-        "access_token": access_token, 
+        "access_token": access_token,
         "token_type": "bearer",
         "email": user.email,
         "name": user.name,
@@ -1205,16 +1216,16 @@ def register_user(name: str = Form(...), email: str = Form(...), password: str =
     safe_email = email.strip().lower()
 
     if not safe_name:
-        raise HTTPException(status_code=400, detail="Ism bo'sh bo'lishi mumkin emas")
+        raise HTTPException(status_code=400, detail="Имя не может быть пустым")
     if not safe_email:
-        raise HTTPException(status_code=400, detail="Email bo'sh bo'lishi mumkin emas")
+        raise HTTPException(status_code=400, detail="Email не может быть пустым")
 
     validate_password_strength(password)
 
     try:
         existing = db.query(database.User).filter(database.User.email == safe_email).first()
         if existing:
-            raise HTTPException(status_code=409, detail="Bu email allaqachon ro'yxatdan o'tgan")
+            raise HTTPException(status_code=409, detail="Этот email уже зарегистрирован")
 
         db_user = database.User(
             name=safe_name,
@@ -1230,12 +1241,50 @@ def register_user(name: str = Form(...), email: str = Form(...), password: str =
         raise
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail=f"Email allaqachon mavjud: {safe_email}") from exc
+        raise HTTPException(status_code=409, detail=f"Email уже существует: {safe_email}") from exc
     except Exception as exc:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Ro'yxatdan o'tishda backend xatosi: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"Ошибка регистрации: {exc}") from exc
 
 # --- User Management ---
+@app.get("/auth/profile", response_model=schemas.UserSchema)
+def get_profile(user: database.User = Depends(require_admin)):
+    return user
+
+@app.put("/auth/profile")
+def update_profile(
+    name: str = Form(None),
+    email: str = Form(None),
+    db: Session = Depends(get_db),
+    user: database.User = Depends(require_admin),
+):
+    if name:
+        user.name = bleach.clean(name.strip(), tags=[], strip=True)
+    if email:
+        safe_email = email.strip().lower()
+        existing = db.query(database.User).filter(database.User.email == safe_email, database.User.id != user.id).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="Этот email уже используется")
+        user.email = safe_email
+    db.commit()
+    db.refresh(user)
+    return {"status": "updated", "name": user.name, "email": user.email}
+
+@app.post("/auth/change-password")
+def change_password(
+    old_password: str = Form(...),
+    new_password: str = Form(...),
+    db: Session = Depends(get_db),
+    user: database.User = Depends(require_admin),
+):
+    if not verify_password(old_password, user.password):
+        raise HTTPException(status_code=400, detail="Текущий пароль неверный")
+    validate_password_strength(new_password)
+    user.password = get_password_hash(new_password)
+    db.commit()
+    return {"status": "password_changed"}
+
+
 @app.get("/users/", response_model=List[schemas.UserSchema])
 def read_users(db: Session = Depends(get_db), admin: database.User = Depends(require_role(["SuperAdmin"]))):
     return db.query(database.User).order_by(database.User.id.asc()).all()

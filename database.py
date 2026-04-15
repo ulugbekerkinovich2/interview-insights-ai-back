@@ -66,6 +66,9 @@ class User(Base):
     password = Column(String)
     role = Column(String, default="Recruiter") # SuperAdmin, Recruiter, Psychologist
     is_active = Column(Boolean, default=True)
+    login_count = Column(Integer, default=0)
+    last_login = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 class Candidate(Base):
     __tablename__ = "candidates"
