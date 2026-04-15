@@ -673,6 +673,15 @@ def update_candidate(candidate_id: int, candidate: schemas.CandidateCreate, db: 
     db.refresh(db_candidate)
     return db_candidate
 
+@app.delete("/candidates/{candidate_id}")
+def delete_candidate(candidate_id: int, db: Session = Depends(get_db), _: database.User = Depends(require_role(["SuperAdmin", "Recruiter"]))):
+    candidate = get_candidate_or_404(db, candidate_id)
+    # Delete related visual records
+    db.query(database.VisualRecord).filter(database.VisualRecord.candidate_id == candidate_id).delete()
+    db.delete(candidate)
+    db.commit()
+    return {"status": "deleted"}
+
 # --- Chat Endpoints ---
 
 @app.get("/chat/", response_model=List[schemas.ChatMessageSchema])
@@ -739,6 +748,15 @@ def clear_chat_history(db: Session = Depends(get_db), _: database.User = Depends
     db.commit()
     return {"status": "cleared"}
 
+@app.delete("/chat/{message_id}")
+def delete_chat_message(message_id: int, db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
+    msg = db.query(ChatMessage).filter(ChatMessage.id == message_id).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Сообщение не найдено")
+    db.delete(msg)
+    db.commit()
+    return {"status": "deleted"}
+
 # --- Settings Endpoints ---
 
 @app.get("/settings/{key}", response_model=schemas.GlobalSettingSchema)
@@ -759,6 +777,15 @@ def set_setting(setting: schemas.GlobalSettingBase, db: Session = Depends(get_db
     db.commit()
     db.refresh(db_setting)
     return db_setting
+
+@app.delete("/settings/{key}")
+def delete_setting(key: str, db: Session = Depends(get_db), _: database.User = Depends(require_role(["SuperAdmin"]))):
+    setting = db.query(GlobalSetting).filter(GlobalSetting.key == key).first()
+    if not setting:
+        raise HTTPException(status_code=404, detail="Настройка не найдена")
+    db.delete(setting)
+    db.commit()
+    return {"status": "deleted"}
 
 # --- Logic Endpoints (AI) ---
 
@@ -1307,6 +1334,42 @@ def create_user(name: str = Form(...), email: str = Form(...), password: str = F
     db.refresh(db_user)
     return db_user
 
+@app.get("/users/{user_id}", response_model=schemas.UserSchema)
+def get_user(user_id: int, db: Session = Depends(get_db), _: database.User = Depends(require_role(["SuperAdmin"]))):
+    user = db.query(database.User).filter(database.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    return user
+
+@app.put("/users/{user_id}", response_model=schemas.UserSchema)
+def update_user(
+    user_id: int,
+    name: str = Form(None),
+    email: str = Form(None),
+    role: str = Form(None),
+    is_active: bool = Form(None),
+    db: Session = Depends(get_db),
+    admin: database.User = Depends(require_role(["SuperAdmin"])),
+):
+    user = db.query(database.User).filter(database.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    if name is not None:
+        user.name = bleach.clean(name.strip(), tags=[], strip=True)
+    if email is not None:
+        safe_email = email.strip().lower()
+        existing = db.query(database.User).filter(database.User.email == safe_email, database.User.id != user_id).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="Этот email уже используется")
+        user.email = safe_email
+    if role is not None and role in ("SuperAdmin", "Recruiter", "Psychologist"):
+        user.role = role
+    if is_active is not None:
+        user.is_active = is_active
+    db.commit()
+    db.refresh(user)
+    return user
+
 @app.delete("/users/{user_id}")
 def delete_user(user_id: int, db: Session = Depends(get_db), admin: database.User = Depends(require_role(["SuperAdmin"]))):
     user = db.query(database.User).filter(database.User.id == user_id).first()
@@ -1366,6 +1429,23 @@ def mark_all_read(db: Session = Depends(get_db), user: database.User = Depends(r
         (database.Notification.user_id == user.id) | (database.Notification.user_id.is_(None)),
         database.Notification.is_read == False,
     ).update({"is_read": True}, synchronize_session=False)
+    db.commit()
+    return {"status": "ok"}
+
+
+@app.delete("/notifications/{notification_id}")
+def delete_notification(notification_id: int, db: Session = Depends(get_db), user: database.User = Depends(require_admin)):
+    notif = db.query(database.Notification).filter_by(id=notification_id).first()
+    if notif and (notif.user_id == user.id or notif.user_id is None):
+        db.delete(notif)
+        db.commit()
+    return {"status": "ok"}
+
+@app.delete("/notifications/")
+def delete_all_notifications(db: Session = Depends(get_db), user: database.User = Depends(require_admin)):
+    db.query(database.Notification).filter(
+        (database.Notification.user_id == user.id) | (database.Notification.user_id.is_(None))
+    ).delete(synchronize_session=False)
     db.commit()
     return {"status": "ok"}
 
