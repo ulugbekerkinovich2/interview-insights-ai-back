@@ -33,47 +33,31 @@ class AIServiceError(LogicError):
 import threading
 _whisper_lock = threading.Lock()
 
+# Model size: "tiny" (fast, low accuracy) → "base" (balanced) → "small" (accurate, slower)
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "base")
+
 def load_whisper_model():
     global _whisper_model
     if _whisper_model is not None:
         return _whisper_model
     with _whisper_lock:
         if _whisper_model is None:
-            _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+            _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+            logger.info(f"Whisper model loaded: {WHISPER_MODEL_SIZE}")
     return _whisper_model
 
-def _convert_to_wav(audio_path: str) -> str:
-    """Convert audio to WAV format for Whisper. No duration limit."""
-    if audio_path.endswith(".wav"):
-        return audio_path
-    ffmpeg_bin = shutil.which("ffmpeg")
-    if not ffmpeg_bin:
-        return audio_path
-    wav_path = audio_path + ".converted.wav"
-    try:
-        subprocess.run(
-            [ffmpeg_bin, "-y", "-i", audio_path, "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", wav_path],
-            capture_output=True, text=True, timeout=30,
-        )
-        if os.path.exists(wav_path) and os.path.getsize(wav_path) > 100:
-            return wav_path
-    except Exception:
-        pass
-    return audio_path
 
 def transcribe_audio(audio_path: str):
     """Returns (transcript, elapsed_ms) tuple."""
     if not os.path.exists(audio_path):
         raise TranscriptionError("Audio file not found")
 
-    # Convert to WAV for Whisper compatibility (no duration limit)
-    trimmed_path = _convert_to_wav(audio_path)
-
     def _run_transcription(path: str) -> str:
         model = load_whisper_model()
+        # faster-whisper supports webm/ogg directly via ffmpeg binding — no manual conversion needed
         segments, _ = model.transcribe(
             path,
-            beam_size=1,
+            beam_size=2,
             vad_filter=True,
             condition_on_previous_text=False,
             language="ru",
@@ -88,12 +72,9 @@ def transcribe_audio(audio_path: str):
     import time
     t0 = time.time()
     try:
-        transcript = _run_transcription(trimmed_path)
+        transcript = _run_transcription(audio_path)
     except Exception as exc:
         raise TranscriptionError(f"Transcription failed: {exc}") from exc
-    finally:
-        if trimmed_path != audio_path and os.path.exists(trimmed_path):
-            os.remove(trimmed_path)
 
     elapsed_ms = int((time.time() - t0) * 1000)
     logger.info(f"Whisper STT: {elapsed_ms}ms | {len(transcript)} chars")
@@ -103,93 +84,71 @@ def transcribe_audio(audio_path: str):
 
     return transcript, elapsed_ms
 
-def run_rag_mistral(question: str, answer: str, context: str = ""):
-    rag_script_path = os.path.join(PROJECT_DIR, "utils", "rag_mistral_remote.py")
-    if not os.path.exists(rag_script_path):
-        raise AIServiceError(f"Script not found: {rag_script_path}")
+import requests as http_requests
+from dotenv import load_dotenv as _load_dotenv
+_load_dotenv(os.path.join(os.path.dirname(PROJECT_DIR), ".env"))
+_load_dotenv(os.path.join(PROJECT_DIR, ".env"))
 
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    
-    cmd_with_args = [
-        sys.executable,
-        rag_script_path,
-        "--question",
-        question.strip(),
-        "--answer",
-        answer.strip(),
-    ]
-    if context:
-        cmd_with_args.extend(["--context", context.strip()])
-    
-    try:
-        # Reduced timeout to 45 seconds for better UX during server down
-        result = subprocess.run(
-            cmd_with_args,
-            cwd=PROJECT_DIR,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-            timeout=45, 
-        )
-    except subprocess.TimeoutExpired:
-        raise AIServiceError("AI сервер не ответил вовремя (Timeout). Проверьте VPN или подключение к серверу.")
-    except Exception as exc:
-        raise AIServiceError(f"AI jarayonida kutilmagan xato: {str(exc)}")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
+MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
 
-    if result.returncode != 0:
-        raise AIServiceError(result.stderr.strip() or result.stdout.strip() or "AI process failed")
 
-    if not result.stdout.strip():
-        raise AIServiceError("AI process returned empty response")
+def _call_mistral_cloud(prompt: str) -> str:
+    """Direct Mistral Cloud API call — no subprocess overhead."""
+    headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
+    data = {"model": MISTRAL_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.4, "max_tokens": 1024}
+    resp = http_requests.post(MISTRAL_API_URL, json=data, headers=headers, timeout=60)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
 
-    return result.stdout.strip()
 
-def extract_mistral_answer(raw_text: str) -> str:
-    if not raw_text:
-        return "Analysis not obtained"
-    
-    for marker in ["ОТВЕТ MISTRAL:", "ОТВЕТ MISTRAL"]:
-        if marker in raw_text:
-            cleaned = raw_text.split(marker, 1)[1].strip(": \n\r\t")
-            if cleaned:
-                return cleaned
-    return raw_text.strip()
-    
-def ask_mistral_raw(prompt: str) -> str:
-    rag_script_path = os.path.join(PROJECT_DIR, "utils", "rag_mistral_remote.py")
-    if not os.path.exists(rag_script_path):
-        raise AIServiceError(f"Script not found: {rag_script_path}")
+def _call_ollama(prompt: str) -> str:
+    """Fallback: local Ollama server."""
+    resp = http_requests.post(f"{OLLAMA_BASE_URL}/api/generate", json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}, timeout=120)
+    resp.raise_for_status()
+    return resp.json().get("response", "").strip()
 
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    
-    try:
-        result = subprocess.run(
-            [sys.executable, rag_script_path, "--prompt", prompt.strip()],
-            cwd=PROJECT_DIR,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-            timeout=60, 
-        )
-        if result.returncode != 0:
-            raise AIServiceError(result.stderr.strip() or result.stdout.strip() or "AI process failed")
-        
-        return extract_mistral_answer(result.stdout.strip())
-    except subprocess.TimeoutExpired:
-        raise AIServiceError("AI сервер не ответил (Timeout).")
-    except Exception as exc:
-        raise AIServiceError(f"AI jarayonida xato: {str(exc)}")
+
+def _call_ai(prompt: str) -> str:
+    """Try Mistral Cloud first, fallback to Ollama."""
+    if MISTRAL_API_KEY:
+        try:
+            return _call_mistral_cloud(prompt)
+        except Exception as e:
+            logger.warning(f"Mistral Cloud error, falling back to Ollama: {e}")
+    return _call_ollama(prompt)
+
+
+def _build_analysis_prompt(question: str, answer: str, context: str = "") -> str:
+    question_block = f"\nВопрос HR:\n{question}\n" if question else ""
+    context_block = f"\nТРЕБОВАНИЯ КОМПАНИИ:\n{context}\n" if context else ""
+    return f"""Вы — профессиональный психолог и AI-интервьюер.
+Задача: проанализировать ответ кандидата.
+{context_block}
+Данные:
+{question_block}
+Ответ кандидата:
+{answer}
+
+ВЕРНИТЕ АНАЛИЗ НА РУССКОМ ЯЗЫКЕ:
+1. ОБЩИЙ ВЫВОД: Суть ответа и уверенность кандидата.
+2. СООТВЕТСТВИЕ КОМПАНИИ (FIT SCORE): 0-100.
+3. ПСИХОЛОГИЧЕСКИЕ АСПЕКТЫ: Уклонение, волнение, абстрактность.
+4. СЛЕДУЮЩИЙ СТРАТЕГИЧЕСКИЙ ВОПРОС: Предложите вопрос для выявления слабых сторон.
+
+ВАЖНО: Пишите только на русском языке."""
 
 
 def analyze_answer(question: str, answer: str, context: str = "") -> str:
-    raw_output = run_rag_mistral(question, answer, context)
-    return extract_mistral_answer(raw_output)
+    prompt = _build_analysis_prompt(question, answer, context)
+    return _call_ai(prompt)
+
+
+def ask_mistral_raw(prompt: str) -> str:
+    return _call_ai(prompt)
 
 def build_interview_summary(answers: list) -> str:
     if not answers:

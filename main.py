@@ -904,20 +904,14 @@ def process_turn_api(
     with open(save_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Step 1: FAST — Whisper transcription + voice prosody
+    # Step 1: FAST — Whisper transcription only (return immediately)
     audio_path = str(save_path)
     try:
         transcript, stt_ms = logic.transcribe_audio(audio_path)
     except logic.TranscriptionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    voice_raw = ""
-    try:
-        voice_raw = logic.run_voice_profiler(audio_path)
-    except Exception as e:
-        logger.warning(f"Voice profiling failed: {e}")
-
-    # Save basic answer to DB immediately with unique turn_uid
+    # Save basic answer to DB immediately (no prosody, no AI — those run in background)
     turn_uid = str(uuid.uuid4())
     basic_result = {
         "turn_uid": turn_uid,
@@ -925,7 +919,7 @@ def process_turn_api(
         "answer": transcript,
         "ai": "",
         "next_suggestion": "",
-        "voice_raw": voice_raw,
+        "voice_raw": "",
         "candidate_raw": "",
         "audio_url": f"/media/audio/{audio_filename}",
         "question_audio_url": question_audio_url or "",
@@ -941,32 +935,41 @@ def process_turn_api(
         db.rollback()
         logger.error(f"DB commit failed in process-turn: {e}")
 
-    # Step 2: BACKGROUND — AI analysis only (no Whisper again)
+    # Step 2: BACKGROUND — prosody + AI analysis (don't block response)
     import threading
 
-    def run_ai_analysis():
+    def run_background_analysis():
         analysis_db = SessionLocal()
         try:
-            # Only RAG analysis — skip Whisper (already done above)
+            # Voice prosody (librosa) — 4-8 seconds
+            voice_raw = ""
+            try:
+                voice_raw = logic.run_voice_profiler(audio_path)
+            except Exception as e:
+                logger.warning(f"Voice profiler failed: {e}")
+                voice_raw = ""
+
+            # AI analysis (Mistral) — 10-30 seconds
             rag_ai = ""
             try:
                 rag_ai = logic.analyze_answer(question, transcript)
             except Exception:
                 rag_ai = "AI анализ недоступен"
 
-            # Update the correct answer by matching turn_uid (not index)
+            # Update the correct answer by matching turn_uid
             cand = analysis_db.query(database.Candidate).filter_by(id=candidate_id).first()
             if cand:
                 ans = list(cand.answers or [])
                 for i, item in enumerate(ans):
                     if item.get("turn_uid") == turn_uid:
                         ans[i]["ai"] = rag_ai
+                        ans[i]["voice_raw"] = voice_raw
                         break
                 cand.answers = ans
                 flag_modified(cand, "answers")
                 analysis_db.commit()
 
-            # Broadcast AI result to admin via WebSocket
+            # Broadcast results to admin via WebSocket
             try:
                 loop = asyncio.new_event_loop()
                 loop.run_until_complete(manager.broadcast({
@@ -974,8 +977,8 @@ def process_turn_api(
                     "candidate_id": candidate_id,
                     "question": question,
                     "ai": rag_ai,
+                    "voice_raw": voice_raw,
                     "audio_url": basic_result.get("audio_url", ""),
-                    "voice_raw": basic_result.get("voice_raw", ""),
                     "turn_uid": turn_uid,
                 }))
                 loop.close()
@@ -987,12 +990,12 @@ def process_turn_api(
                 f"📝 <b>Ответ проанализирован</b>\n❓ {question}\n💬 {transcript[:100]}...\n🧠 {rag_ai[:150]}"
             )
         except Exception as e:
-            logger.error(f"Background AI failed: {e}")
+            logger.error(f"Background analysis failed: {e}")
         finally:
             analysis_db.close()
 
     try:
-        thread = threading.Thread(target=run_ai_analysis, daemon=True)
+        thread = threading.Thread(target=run_background_analysis, daemon=True)
         thread.start()
     except Exception as e:
         logger.error(f"Failed to start AI thread: {e}")
