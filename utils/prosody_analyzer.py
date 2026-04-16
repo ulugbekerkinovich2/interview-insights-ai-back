@@ -1,10 +1,12 @@
 import sys
 import warnings
-import librosa
 import numpy as np
 
 warnings.filterwarnings("ignore", category=UserWarning, module="librosa")
 warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")
+
+import librosa
+
 
 def analyze_prosody(audio_path):
     try:
@@ -15,74 +17,88 @@ def analyze_prosody(audio_path):
 
         duration = len(y) / sr
 
-        # 1. Pitch (F0) analysis
-        pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
-        pitch_values = pitches[pitches > 0]
+        # 1. Pitch (F0) — use pyin for more accurate fundamental frequency
+        f0, voiced_flag, _ = librosa.pyin(y, fmin=60, fmax=500, sr=sr)
+        f0_voiced = f0[voiced_flag] if voiced_flag is not None else f0[~np.isnan(f0)]
+        f0_voiced = f0_voiced[~np.isnan(f0_voiced)]
 
-        if len(pitch_values) > 0:
-            pitch_std = np.std(pitch_values)
-            pitch_mean = np.mean(pitch_values)
-            pitch_stability = round(100 - (min(pitch_std / pitch_mean, 1.0) * 100), 1)
-            pitch_range = round(float(np.max(pitch_values) - np.min(pitch_values)), 1)
+        if len(f0_voiced) > 5:
+            pitch_mean = float(np.mean(f0_voiced))
+            pitch_std = float(np.std(f0_voiced))
+            # Coefficient of variation — lower = more stable
+            cv = pitch_std / pitch_mean if pitch_mean > 0 else 1.0
+            # Normal speech CV is 0.1-0.3, stressed is 0.3-0.6
+            pitch_stability = round(max(0, min(100, (1 - cv / 0.5) * 100)), 1)
+            pitch_range = round(float(np.max(f0_voiced) - np.min(f0_voiced)), 1)
         else:
-            pitch_stability = 0
+            pitch_stability = 50.0
             pitch_mean = 0
             pitch_range = 0
 
-        # 2. Energy (RMS) — loudness dynamics
+        # 2. Energy (RMS) — frame-level loudness
         rms = librosa.feature.rms(y=y)[0]
         rms_mean = float(np.mean(rms))
-        energy_std = np.std(rms)
-        energy_stability = round(100 - (min(energy_std / rms_mean, 1.0) * 100) if rms_mean > 0 else 0, 1)
+        if rms_mean > 0:
+            rms_std = float(np.std(rms))
+            ecv = rms_std / rms_mean
+            # Normal speech ecv is 0.5-1.0, monotone <0.5, stressed >1.5
+            energy_stability = round(max(0, min(100, (1 - ecv / 1.5) * 100)), 1)
+        else:
+            energy_stability = 50.0
 
         # 3. Tempo / speech rate
         onset_env = librosa.onset.onset_strength(y=y, sr=sr)
         tempo = librosa.feature.tempo(onset_envelope=onset_env, sr=sr)[0]
         tempo = round(float(tempo), 0)
 
-        # 4. Pauses detection (silence ratio)
+        # 4. Pauses detection
         intervals = librosa.effects.split(y, top_db=30)
         speech_duration = sum(end - start for start, end in intervals) / sr
         silence_ratio = round((1 - speech_duration / duration) * 100, 1) if duration > 0 else 0
 
-        # 5. Vocal stress classification
-        if pitch_stability < 35 or energy_stability < 25:
+        # 5. Stress classification — balanced thresholds
+        stress_score = (100 - pitch_stability) * 0.6 + (100 - energy_stability) * 0.4
+        if stress_score > 65:
             stress_level = "Высокий"
             stress_emoji = "🔴"
-        elif pitch_stability < 60 or energy_stability < 50:
+        elif stress_score > 40:
             stress_level = "Средний"
             stress_emoji = "🟡"
         else:
             stress_level = "Низкий"
             stress_emoji = "🟢"
 
-        # 6. Tone classification
-        if pitch_stability > 70 and energy_stability > 60:
+        # 6. Tone
+        if pitch_stability > 65 and energy_stability > 55:
             tone = "Спокойный, уверенный"
-        elif pitch_stability > 55:
+        elif pitch_stability > 50 and energy_stability > 40:
             tone = "Умеренно уверенный"
-        elif pitch_stability > 40:
+        elif pitch_stability > 35:
             tone = "Немного неуверенный"
         else:
             tone = "Нервозный, неуверенный"
 
-        # 7. Emotion estimation
-        if pitch_stability > 65 and energy_stability > 55:
+        # 7. Emotion
+        if pitch_stability > 60 and energy_stability > 50:
             emotion = "Спокойствие, вовлечённость"
-        elif pitch_range > 200 and energy_stability < 50:
+        elif pitch_stability < 35 and energy_stability < 35:
             emotion = "Волнение, тревожность"
-        elif energy_stability > 70 and pitch_stability < 50:
+        elif energy_stability > 60 and pitch_stability < 40:
             emotion = "Напряжённость"
+        elif pitch_range > 100 and tempo > 130:
+            emotion = "Энтузиазм, увлечённость"
         else:
             emotion = "Умеренные эмоции"
 
-        # 8. Articulation quality
-        if tempo > 80 and tempo < 160 and silence_ratio > 10 and silence_ratio < 40:
+        # 8. Articulation
+        if 80 < tempo < 150 and 10 < silence_ratio < 35:
             articulation = "Чёткая, с логическими паузами"
-        elif tempo > 160:
+        elif tempo > 150:
             articulation = "Быстрая речь, мало пауз"
         elif tempo < 80:
             articulation = "Замедленная речь"
+        elif silence_ratio > 40:
+            articulation = "Много пауз, неуверенная"
         else:
             articulation = "Нормальная"
 
@@ -104,7 +120,6 @@ def analyze_prosody(audio_path):
 
 
 def format_report(data):
-    """Format prosody data as readable Russian text"""
     if "error" in data:
         return f"Ошибка анализа: {data['error']}"
 
