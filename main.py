@@ -410,7 +410,8 @@ def get_protected_audio(
         raise HTTPException(status_code=404, detail="Audio fayl topilmadi")
     from fastapi.responses import FileResponse
     media_type = "audio/webm" if filename.endswith(".webm") else "audio/ogg" if filename.endswith(".ogg") else "audio/wav"
-    return FileResponse(file_path, media_type=media_type)
+    file_size = file_path.stat().st_size
+    return FileResponse(file_path, media_type=media_type, headers={"Accept-Ranges": "bytes", "Content-Length": str(file_size)})
 
 
 @app.get("/health", response_model=schemas.HealthSchema)

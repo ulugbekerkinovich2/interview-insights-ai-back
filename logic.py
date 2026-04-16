@@ -54,13 +54,13 @@ def transcribe_audio(audio_path: str):
 
     def _run_transcription(path: str) -> str:
         model = load_whisper_model()
-        # faster-whisper supports webm/ogg directly via ffmpeg binding — no manual conversion needed
         segments, _ = model.transcribe(
             path,
             beam_size=2,
             vad_filter=True,
             condition_on_previous_text=False,
             language="ru",
+            initial_prompt="Интервью. React, Python, FastAPI, PostgreSQL, Docker, JavaScript, TypeScript, Node.js, Redis, Celery, DevOps, CI/CD, Git, Linux, AWS, Kubernetes.",
         )
         parts = []
         for segment in segments:
