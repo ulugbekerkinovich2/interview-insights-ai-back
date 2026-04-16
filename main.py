@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 import asyncio
+import json
 import shutil
 import tempfile
 import datetime
@@ -993,6 +994,7 @@ def process_turn_api(
     question: str = Form(...),
     file: UploadFile = File(...),
     question_audio_url: Optional[str] = Form(None),
+    face_stats: Optional[str] = Form(None),
     db: Session = Depends(get_db),
     _: database.User = Depends(require_admin),
 ):
@@ -1024,6 +1026,14 @@ def process_turn_api(
     # INSTANT RESPONSE — save audio, return immediately, process everything in background
     audio_path = str(save_path)
     turn_uid = str(uuid.uuid4())
+    # Parse face stats from JSON
+    parsed_face_stats = None
+    if face_stats:
+        try:
+            parsed_face_stats = json.loads(face_stats)
+        except Exception:
+            pass
+
     basic_result = {
         "turn_uid": turn_uid,
         "question": question,
@@ -1034,6 +1044,7 @@ def process_turn_api(
         "candidate_raw": "",
         "audio_url": f"/media/audio/{audio_filename}",
         "question_audio_url": question_audio_url or "",
+        "face_stats": parsed_face_stats,
         "stt_ms": 0,
     }
     answers = list(candidate.answers or [])
@@ -1074,11 +1085,15 @@ def process_turn_api(
                 logger.warning(f"Voice profiler failed: {e}")
             prosody_ms = int((_time.time() - t0) * 1000)
 
-            # Step 3: AI analysis (Mistral + RAG)
+            # Step 3: AI analysis (Mistral + RAG + face stats)
+            face_context = ""
+            if parsed_face_stats:
+                face_context = f"\nДАННЫЕ ВИДЕОАНАЛИЗА ЛИЦА: Взгляд сфокусирован {parsed_face_stats.get('gaze_focused_pct', 0)}%, отведён {parsed_face_stats.get('gaze_away_pct', 0)}%, глаза закрыты {parsed_face_stats.get('eyes_closed_pct', 0)}%."
+
             rag_ai = ""
             t0 = _time.time()
             try:
-                rag_ai = logic.analyze_answer(question, transcript)
+                rag_ai = logic.analyze_answer(question, transcript, context=face_context)
             except Exception:
                 rag_ai = "AI анализ недоступен"
             ai_ms = int((_time.time() - t0) * 1000)
