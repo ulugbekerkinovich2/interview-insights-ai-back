@@ -86,6 +86,18 @@ def verify_password(plain_password, hashed_password):
 
 from database import Candidate, ChatMessage, GlobalSetting, SessionLocal
 
+
+def _broadcast_sync(message: dict):
+    """Safely broadcast via WebSocket from sync context (background threads)."""
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(manager.broadcast(message))
+    except Exception:
+        pass
+    finally:
+        loop.close()
+
+
 # WebSocket Manager for Real-time Admin Updates
 class ConnectionManager:
     def __init__(self):
@@ -580,16 +592,7 @@ def candidate_login(request: Request, access_code: str = Form(...), pin: str = F
     create_notification(db, f"Кандидат подключился", f"{candidate.name} (ID: {candidate.id}) вошёл в сессию", "info")
 
     # Notify admin about candidate joining
-    try:
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(manager.broadcast({
-            "type": "NOTIFICATION",
-            "message": f"📢 Кандидат подключился: {candidate.name}",
-            "timestamp": datetime.datetime.now().strftime("%H:%M:%S")
-        }))
-        loop.close()
-    except Exception:
-        pass
+    _broadcast_sync({"type": "NOTIFICATION", "message": f"📢 Кандидат подключился: {candidate.name}", "timestamp": datetime.datetime.now().strftime("%H:%M:%S")})
 
     candidate_token = create_candidate_token(candidate.id)
     return {"status": "success", "candidate_id": candidate.id, "name": candidate.name, "candidate_token": candidate_token}
@@ -641,16 +644,7 @@ def candidate_login_by_token(
         f"📱 <b>Кандидат вошёл по QR</b>\n\n👤 {candidate.name}\n🆔 ID: {candidate.id}"
     )
 
-    try:
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(manager.broadcast({
-            "type": "NOTIFICATION",
-            "message": f"📢 Кандидат подключился по QR: {candidate.name}",
-            "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
-        }))
-        loop.close()
-    except Exception:
-        pass
+    _broadcast_sync({"type": "NOTIFICATION", "message": f"📢 Кандидат подключился по QR: {candidate.name}", "timestamp": datetime.datetime.now().strftime("%H:%M:%S")})
 
     return {
         "status": "success",
@@ -828,26 +822,14 @@ def transcribe_audio_api(file: UploadFile = File(...), save: bool = False, _: da
                 # Store result in global settings for polling
                 with SessionLocal() as tdb:
                     setting = database.GlobalSetting(key=f"stt_result_{task_id}", value={"text": text, "elapsed_ms": elapsed_ms, "audio_url": audio_url, "status": "done"})
-                    tdb.merge(setting)
+                    tdb.add(setting)
                     tdb.commit()
-                # Broadcast to admin via WebSocket
-                try:
-                    loop = asyncio.new_event_loop()
-                    loop.run_until_complete(manager.broadcast({
-                        "type": "STT_RESULT",
-                        "task_id": task_id,
-                        "text": text,
-                        "audio_url": audio_url,
-                        "elapsed_ms": elapsed_ms,
-                    }))
-                    loop.close()
-                except Exception:
-                    pass
+                _broadcast_sync({"type": "STT_RESULT", "task_id": task_id, "text": text, "audio_url": audio_url, "elapsed_ms": elapsed_ms})
             except Exception as e:
                 logger.warning(f"Background transcribe failed: {e}")
                 with SessionLocal() as tdb:
                     setting = database.GlobalSetting(key=f"stt_result_{task_id}", value={"text": "", "error": str(e), "audio_url": audio_url, "status": "error"})
-                    tdb.merge(setting)
+                    tdb.add(setting)
                     tdb.commit()
 
         thread = threading.Thread(target=background_transcribe, daemon=True)
@@ -1000,7 +982,7 @@ def process_turn_api(
         db.commit()
     except Exception as e:
         db.rollback()
-        logger.error(f"DB commit failed in process-turn: {e}")
+        raise HTTPException(status_code=500, detail=f"Не удалось сохранить: {e}")
 
     # ALL PROCESSING IN BACKGROUND — Whisper + prosody + AI
     import threading
@@ -1032,7 +1014,7 @@ def process_turn_api(
                 rag_ai = "AI анализ недоступен"
 
             # Update the answer with all results
-            cand = analysis_db.query(database.Candidate).filter_by(id=candidate_id).first()
+            cand = analysis_db.query(database.Candidate).with_for_update().filter_by(id=candidate_id).first()
             if cand:
                 ans = list(cand.answers or [])
                 for i, item in enumerate(ans):
@@ -1046,30 +1028,15 @@ def process_turn_api(
                 flag_modified(cand, "answers")
                 analysis_db.commit()
 
-            # Broadcast ALL results to admin via WebSocket
-            try:
-                loop = asyncio.new_event_loop()
-                loop.run_until_complete(manager.broadcast({
-                    "type": "TURN_RESULT",
-                    "candidate_id": candidate_id,
-                    "question": question,
-                    "answer": transcript,
-                    "ai": rag_ai,
-                    "voice_raw": voice_raw,
-                    "audio_url": basic_result.get("audio_url", ""),
-                    "turn_uid": turn_uid,
-                    "stt_ms": stt_ms,
-                }))
-                loop.close()
-            except Exception:
-                pass
+            _broadcast_sync({"type": "TURN_RESULT", "candidate_id": candidate_id, "question": question, "answer": transcript, "ai": rag_ai, "voice_raw": voice_raw, "audio_url": basic_result.get("audio_url", ""), "turn_uid": turn_uid, "stt_ms": stt_ms})
 
-            # Telegram
-            send_telegram_notification(
-                f"📝 <b>Ответ проанализирован</b>\n❓ {question}\n💬 {transcript[:100]}...\n🧠 {rag_ai[:150]}"
-            )
+            send_telegram_notification(f"📝 <b>Ответ проанализирован</b>\n❓ {question}\n💬 {transcript[:100]}...\n🧠 {rag_ai[:150]}")
         except Exception as e:
             logger.error(f"Background analysis failed: {e}")
+            try:
+                analysis_db.rollback()
+            except Exception:
+                pass
         finally:
             analysis_db.close()
 

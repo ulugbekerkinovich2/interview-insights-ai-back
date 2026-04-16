@@ -207,7 +207,7 @@ def run_candidate_profiler(audio_path: str, transcript_path: str, visual_path: s
         # Note: we use empty visual info if not provided
         result = subprocess.run(
             [sys.executable, script_path, audio_path, transcript_path, visual_path, question],
-            capture_output=True, text=True, encoding="utf-8", env=env
+            capture_output=True, text=True, encoding="utf-8", env=env, timeout=60
         )
         return result.stdout.strip()
     except Exception as e:

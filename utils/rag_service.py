@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 # Lazy imports — don't crash if not installed
 _qdrant_client = None
 _embed_cache: dict = {}
+_EMBED_CACHE_MAX = 2000
 
 QDRANT_URL = os.getenv("QDRANT_URL", "")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
@@ -59,6 +60,11 @@ def _embed_text(text: str) -> Optional[List[float]]:
         )
         resp.raise_for_status()
         vector = resp.json()["data"][0]["embedding"]
+        if len(_embed_cache) >= _EMBED_CACHE_MAX:
+            # Evict oldest half
+            keys = list(_embed_cache.keys())
+            for k in keys[:len(keys) // 2]:
+                del _embed_cache[k]
         _embed_cache[key] = vector
         return vector
     except Exception as e:

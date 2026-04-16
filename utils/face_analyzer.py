@@ -8,8 +8,12 @@ import numpy as np
 try:
     import cv2
     CV2_AVAILABLE = True
+    _face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    _eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
 except ImportError:
     CV2_AVAILABLE = False
+    _face_cascade = None
+    _eye_cascade = None
 
 
 def analyze_frame(image_bytes: bytes) -> dict:
@@ -29,9 +33,8 @@ def analyze_frame(image_bytes: bytes) -> dict:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
 
-        # Detect faces
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+        # Detect faces (cached cascades)
+        faces = _face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
 
         if len(faces) == 0:
             return {
@@ -45,9 +48,8 @@ def analyze_frame(image_bytes: bytes) -> dict:
         x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
         face_roi = gray[y:y+fh, x:x+fw]
 
-        # Detect eyes for gaze estimation
-        eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
-        eyes = eye_cascade.detectMultiScale(face_roi, scaleFactor=1.1, minNeighbors=5, minSize=(20, 20))
+        # Detect eyes for gaze estimation (cached cascade)
+        eyes = _eye_cascade.detectMultiScale(face_roi, scaleFactor=1.1, minNeighbors=5, minSize=(20, 20))
 
         # Gaze direction based on eye position
         if len(eyes) >= 2:
