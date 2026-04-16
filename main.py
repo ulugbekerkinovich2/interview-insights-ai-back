@@ -1156,6 +1156,38 @@ def analyze_frame_api(candidate_id: int, file: UploadFile = File(...)):
 
     return result
 
+@app.post("/logic/face-ai-analysis/")
+def face_ai_analysis(
+    gaze_focused_pct: float = Form(0),
+    gaze_away_pct: float = Form(0),
+    mouth_open_pct: float = Form(0),
+    eyes_closed_pct: float = Form(0),
+    face_not_found_pct: float = Form(0),
+    duration_sec: int = Form(0),
+    _: database.User = Depends(require_admin),
+):
+    """AI analysis of face behavior during interview segment."""
+    prompt = f"""Вы — профессиональный психолог. Проанализируйте поведение кандидата на основе данных видеонаблюдения за {duration_sec} секунд.
+
+ДАННЫЕ:
+- Взгляд сфокусирован: {gaze_focused_pct:.0f}%
+- Взгляд отведён: {gaze_away_pct:.0f}%
+- Рот открыт (говорит): {mouth_open_pct:.0f}%
+- Глаза закрыты: {eyes_closed_pct:.0f}%
+- Лицо не найдено: {face_not_found_pct:.0f}%
+
+ВЕРНИТЕ КРАТКИЙ АНАЛИЗ НА РУССКОМ (2-3 предложения):
+1. Уровень вовлечённости и внимания
+2. Признаки стресса или дискомфорта
+3. Общая оценка невербального поведения"""
+
+    try:
+        result = logic._call_ai(prompt)
+        return {"analysis": result}
+    except Exception:
+        return {"analysis": "Анализ недоступен"}
+
+
 @app.websocket("/ws/live-analysis/")
 async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = None):
     # Verify token before accepting connection
