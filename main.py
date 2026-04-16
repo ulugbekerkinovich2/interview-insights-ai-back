@@ -784,6 +784,25 @@ def delete_setting(key: str, db: Session = Depends(get_db), _: database.User = D
 
 # --- Logic Endpoints (AI) ---
 
+@app.post("/logic/upload-audio/")
+def upload_audio_api(file: UploadFile = File(...), _: database.User = Depends(require_admin)):
+    """Upload audio file and return URL immediately. No STT processing."""
+    ext = os.path.splitext(file.filename or "")[1]
+    if not ext:
+        if file.content_type == "audio/webm":
+            ext = ".webm"
+        elif file.content_type == "audio/ogg":
+            ext = ".ogg"
+        else:
+            ext = ".wav"
+    audio_filename = f"{secrets.token_hex(16)}{ext}"
+    save_path = MEDIA_AUDIO_DIR / audio_filename
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(save_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    return {"audio_url": f"/media/audio/{audio_filename}"}
+
+
 @app.post("/logic/transcribe/")
 def transcribe_audio_api(file: UploadFile = File(...), save: bool = False, _: database.User = Depends(require_admin)):
     ext = os.path.splitext(file.filename or "")[1]
