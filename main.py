@@ -470,6 +470,48 @@ def get_candidate_stats(db: Session = Depends(get_db), _: database.User = Depend
         "recent_activity": total # simplified
     }
 
+@app.get("/candidates/{candidate_id}/timing")
+def get_candidate_timing(candidate_id: int, db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
+    """Get processing time statistics for each turn of a candidate."""
+    candidate = get_candidate_or_404(db, candidate_id)
+    answers = candidate.answers or []
+    turns = []
+    total_stt = 0
+    total_prosody = 0
+    total_ai = 0
+    for i, a in enumerate(answers):
+        stt = a.get("stt_wall_ms", a.get("stt_ms", 0))
+        prosody = a.get("prosody_ms", 0)
+        ai = a.get("ai_ms", 0)
+        total = a.get("total_ms", stt + prosody + ai)
+        total_stt += stt
+        total_prosody += prosody
+        total_ai += ai
+        turns.append({
+            "turn": i + 1,
+            "question": (a.get("question") or "")[:80],
+            "stt_ms": stt,
+            "prosody_ms": prosody,
+            "ai_ms": ai,
+            "total_ms": total,
+        })
+    return {
+        "candidate_id": candidate_id,
+        "candidate_name": candidate.name,
+        "turns": turns,
+        "summary": {
+            "total_turns": len(turns),
+            "total_stt_ms": total_stt,
+            "total_prosody_ms": total_prosody,
+            "total_ai_ms": total_ai,
+            "total_ms": total_stt + total_prosody + total_ai,
+            "avg_stt_ms": round(total_stt / len(turns)) if turns else 0,
+            "avg_prosody_ms": round(total_prosody / len(turns)) if turns else 0,
+            "avg_ai_ms": round(total_ai / len(turns)) if turns else 0,
+        },
+    }
+
+
 @app.get("/candidates/", response_model=List[schemas.CandidateSchema])
 def read_candidates(db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
     candidates = db.query(Candidate).all()
@@ -1010,28 +1052,36 @@ def process_turn_api(
     def run_full_background_processing():
         analysis_db = SessionLocal()
         try:
+            import time as _time
+
             # Step 1: Whisper STT
             transcript = ""
             stt_ms = 0
+            t0 = _time.time()
             try:
                 transcript, stt_ms = logic.transcribe_audio(audio_path)
             except Exception as e:
                 logger.warning(f"Whisper STT failed: {e}")
                 transcript = "(Речь не распознана)"
+            stt_wall_ms = int((_time.time() - t0) * 1000)
 
             # Step 2: Voice prosody (librosa)
             voice_raw = ""
+            t0 = _time.time()
             try:
                 voice_raw = logic.run_voice_profiler(audio_path)
             except Exception as e:
                 logger.warning(f"Voice profiler failed: {e}")
+            prosody_ms = int((_time.time() - t0) * 1000)
 
             # Step 3: AI analysis (Mistral + RAG)
             rag_ai = ""
+            t0 = _time.time()
             try:
                 rag_ai = logic.analyze_answer(question, transcript)
             except Exception:
                 rag_ai = "AI анализ недоступен"
+            ai_ms = int((_time.time() - t0) * 1000)
 
             # Update the answer with all results
             cand = analysis_db.query(database.Candidate).with_for_update().filter_by(id=candidate_id).first()
@@ -1043,12 +1093,16 @@ def process_turn_api(
                         ans[i]["ai"] = rag_ai
                         ans[i]["voice_raw"] = voice_raw
                         ans[i]["stt_ms"] = stt_ms
+                        ans[i]["stt_wall_ms"] = stt_wall_ms
+                        ans[i]["prosody_ms"] = prosody_ms
+                        ans[i]["ai_ms"] = ai_ms
+                        ans[i]["total_ms"] = stt_wall_ms + prosody_ms + ai_ms
                         break
                 cand.answers = ans
                 flag_modified(cand, "answers")
                 analysis_db.commit()
 
-            _broadcast_sync({"type": "TURN_RESULT", "candidate_id": candidate_id, "question": question, "answer": transcript, "ai": rag_ai, "voice_raw": voice_raw, "audio_url": basic_result.get("audio_url", ""), "turn_uid": turn_uid, "stt_ms": stt_ms})
+            _broadcast_sync({"type": "TURN_RESULT", "candidate_id": candidate_id, "question": question, "answer": transcript, "ai": rag_ai, "voice_raw": voice_raw, "audio_url": basic_result.get("audio_url", ""), "turn_uid": turn_uid, "stt_ms": stt_ms, "stt_wall_ms": stt_wall_ms, "prosody_ms": prosody_ms, "ai_ms": ai_ms, "total_ms": stt_wall_ms + prosody_ms + ai_ms})
 
             send_telegram_notification(f"📝 <b>Ответ проанализирован</b>\n❓ {question}\n💬 {transcript[:100]}...\n🧠 {rag_ai[:150]}")
         except Exception as e:
