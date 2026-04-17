@@ -99,7 +99,7 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
 def _call_mistral_cloud(prompt: str) -> str:
     """Direct Mistral Cloud API call — no subprocess overhead."""
     headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
-    data = {"model": MISTRAL_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.4, "max_tokens": 1024}
+    data = {"model": MISTRAL_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 2048}
     resp = http_requests.post(MISTRAL_API_URL, json=data, headers=headers, timeout=300)
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"].strip()
@@ -133,13 +133,12 @@ def _build_analysis_prompt(question: str, answer: str, context: str = "") -> str
 Ответ кандидата:
 {answer}
 
-ВЕРНИТЕ АНАЛИЗ НА РУССКОМ ЯЗЫКЕ:
+ВЕРНИТЕ АНАЛИЗ НА РУССКОМ ЯЗЫКЕ (3 пункта, без рекомендации следующего вопроса):
 1. ОБЩИЙ ВЫВОД: Суть ответа и уверенность кандидата.
 2. СООТВЕТСТВИЕ КОМПАНИИ (FIT SCORE): 0-100.
 3. ПСИХОЛОГИЧЕСКИЕ АСПЕКТЫ: Уклонение, волнение, абстрактность.
-4. СЛЕДУЮЩИЙ СТРАТЕГИЧЕСКИЙ ВОПРОС: Предложите вопрос для выявления слабых сторон.
 
-ВАЖНО: Пишите только на русском языке."""
+ВАЖНО: Пишите только на русском языке. НЕ предлагайте следующий вопрос."""
 
 
 def analyze_answer(question: str, answer: str, context: str = "") -> str:
