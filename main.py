@@ -480,14 +480,20 @@ def get_candidate_timing(candidate_id: int, db: Session = Depends(get_db), _: da
     total_stt = 0
     total_prosody = 0
     total_ai = 0
+    total_cost = 0
+    total_audio_sec = 0
     for i, a in enumerate(answers):
         stt = a.get("stt_wall_ms", a.get("stt_ms", 0))
         prosody = a.get("prosody_ms", 0)
         ai = a.get("ai_ms", 0)
         total = a.get("total_ms", stt + prosody + ai)
+        cost = a.get("cost_usd", 0)
+        audio_sec = a.get("audio_duration_sec", 0)
         total_stt += stt
         total_prosody += prosody
         total_ai += ai
+        total_cost += cost
+        total_audio_sec += audio_sec
         turns.append({
             "turn": i + 1,
             "question": (a.get("question") or "")[:80],
@@ -495,6 +501,8 @@ def get_candidate_timing(candidate_id: int, db: Session = Depends(get_db), _: da
             "prosody_ms": prosody,
             "ai_ms": ai,
             "total_ms": total,
+            "cost_usd": cost,
+            "stt_provider": a.get("stt_provider", "whisper"),
         })
     return {
         "candidate_id": candidate_id,
@@ -509,6 +517,8 @@ def get_candidate_timing(candidate_id: int, db: Session = Depends(get_db), _: da
             "avg_stt_ms": round(total_stt / len(turns)) if turns else 0,
             "avg_prosody_ms": round(total_prosody / len(turns)) if turns else 0,
             "avg_ai_ms": round(total_ai / len(turns)) if turns else 0,
+            "total_cost_usd": round(total_cost, 4),
+            "total_audio_sec": round(total_audio_sec, 1),
         },
     }
 
@@ -1112,6 +1122,25 @@ def process_turn_api(
                         ans[i]["prosody_ms"] = prosody_ms
                         ans[i]["ai_ms"] = ai_ms
                         ans[i]["total_ms"] = stt_wall_ms + prosody_ms + ai_ms
+                        # Cost tracking
+                        audio_duration_sec = 0
+                        try:
+                            import subprocess as _sp
+                            probe = _sp.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", audio_path], capture_output=True, text=True, timeout=5)
+                            audio_duration_sec = float(probe.stdout.strip() or 0)
+                        except Exception:
+                            audio_duration_sec = (stt_ms / 1000) if stt_ms > 0 else 15  # estimate
+                        audio_min = audio_duration_sec / 60
+                        deepgram_cost = audio_min * 0.0043 if logic.DEEPGRAM_API_KEY else 0
+                        # Mistral AI: ~0.2$ per 1M input tokens, ~0.6$ per 1M output tokens
+                        # Estimate: ~2000 tokens per turn = ~$0.0004
+                        mistral_cost = 0.0004
+                        # Mistral embed for RAG: ~$0.0001 per call
+                        embed_cost = 0.0001
+                        turn_cost = round(deepgram_cost + mistral_cost + embed_cost, 6)
+                        ans[i]["cost_usd"] = turn_cost
+                        ans[i]["audio_duration_sec"] = round(audio_duration_sec, 1)
+                        ans[i]["stt_provider"] = "deepgram" if logic.DEEPGRAM_API_KEY else "whisper"
                         break
                 cand.answers = ans
                 flag_modified(cand, "answers")
