@@ -34,7 +34,7 @@ import threading
 _whisper_lock = threading.Lock()
 
 # Model size: "tiny" (fast, low accuracy) → "base" (balanced) → "small" (accurate, slower)
-WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "base")
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "tiny")
 
 def load_whisper_model():
     global _whisper_model
@@ -56,7 +56,7 @@ def transcribe_audio(audio_path: str):
         model = load_whisper_model()
         segments, _ = model.transcribe(
             path,
-            beam_size=2,
+            beam_size=1,
             vad_filter=True,
             condition_on_previous_text=False,
             language="ru",
