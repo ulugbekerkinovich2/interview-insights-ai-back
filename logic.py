@@ -47,34 +47,75 @@ def load_whisper_model():
     return _whisper_model
 
 
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+
+
+def _transcribe_deepgram(audio_path: str) -> str:
+    """Fast cloud STT via Deepgram API (~1-2 seconds)."""
+    if not DEEPGRAM_API_KEY:
+        raise TranscriptionError("Deepgram API key not set")
+
+    with open(audio_path, "rb") as f:
+        audio_data = f.read()
+
+    # Detect content type
+    ext = os.path.splitext(audio_path)[1].lower()
+    content_type = {"webm": "audio/webm", ".ogg": "audio/ogg", ".wav": "audio/wav"}.get(ext, "audio/webm")
+
+    resp = http_requests.post(
+        "https://api.deepgram.com/v1/listen?language=ru&model=nova-2&smart_format=true",
+        headers={"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": content_type},
+        data=audio_data,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    transcript = result.get("results", {}).get("channels", [{}])[0].get("alternatives", [{}])[0].get("transcript", "")
+    return transcript.strip()
+
+
+def _transcribe_whisper(audio_path: str) -> str:
+    """Local Whisper STT fallback."""
+    model = load_whisper_model()
+    segments, _ = model.transcribe(
+        audio_path,
+        beam_size=1,
+        vad_filter=True,
+        condition_on_previous_text=False,
+        language="ru",
+        initial_prompt="Интервью. React, Python, FastAPI, PostgreSQL, Docker, JavaScript, TypeScript, Node.js, Redis, Celery, DevOps, CI/CD, Git, Linux, AWS, Kubernetes.",
+    )
+    parts = []
+    for segment in segments:
+        text = segment.text.strip()
+        if text:
+            parts.append(text)
+    return " ".join(parts).strip()
+
+
 def transcribe_audio(audio_path: str):
-    """Returns (transcript, elapsed_ms) tuple."""
+    """Returns (transcript, elapsed_ms) tuple. Tries Deepgram first, falls back to Whisper."""
     if not os.path.exists(audio_path):
         raise TranscriptionError("Audio file not found")
 
-    def _run_transcription(path: str) -> str:
-        model = load_whisper_model()
-        segments, _ = model.transcribe(
-            path,
-            beam_size=1,
-            vad_filter=True,
-            condition_on_previous_text=False,
-            language="ru",
-            initial_prompt="Интервью. React, Python, FastAPI, PostgreSQL, Docker, JavaScript, TypeScript, Node.js, Redis, Celery, DevOps, CI/CD, Git, Linux, AWS, Kubernetes.",
-        )
-        parts = []
-        for segment in segments:
-            text = segment.text.strip()
-            if text:
-                parts.append(text)
-        return " ".join(parts).strip()
-
     import time
     t0 = time.time()
-    try:
-        transcript = _run_transcription(audio_path)
-    except Exception as exc:
-        raise TranscriptionError(f"Transcription failed: {exc}") from exc
+
+    transcript = ""
+    # Try Deepgram first (fast cloud)
+    if DEEPGRAM_API_KEY:
+        try:
+            transcript = _transcribe_deepgram(audio_path)
+            logger.info(f"Deepgram STT: {int((time.time() - t0) * 1000)}ms | {len(transcript)} chars")
+        except Exception as e:
+            logger.warning(f"Deepgram failed, falling back to Whisper: {e}")
+
+    # Fallback to local Whisper
+    if not transcript:
+        try:
+            transcript = _transcribe_whisper(audio_path)
+        except Exception as exc:
+            raise TranscriptionError(f"Transcription failed: {exc}") from exc
 
     elapsed_ms = int((time.time() - t0) * 1000)
     logger.info(f"Whisper STT: {elapsed_ms}ms | {len(transcript)} chars")
