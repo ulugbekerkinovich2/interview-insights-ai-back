@@ -56,8 +56,8 @@ class UserSchema(BaseModel):
     role: str
     is_active: bool = True
     login_count: Optional[int] = 0
-    last_login: Optional[str] = None
-    created_at: Optional[str] = None
+    last_login: Optional[Any] = None
+    created_at: Optional[Any] = None
 
     class Config:
         from_attributes = True
