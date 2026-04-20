@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict
 
 class AnswerSchema(BaseModel):
     id: int
@@ -88,3 +88,91 @@ class HealthSchema(BaseModel):
     status: str
     service: str
     database: HealthComponentSchema
+
+
+# --- Knowledge base (RAG) ---
+
+class KnowledgeDocCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=300)
+    content: str = Field(..., min_length=1)
+    category: Optional[str] = None
+    language: Optional[str] = "uz"
+
+
+class KnowledgeDocSchema(BaseModel):
+    id: int
+    title: str
+    content: str
+    source_type: str
+    source_name: Optional[str] = None
+    category: Optional[str] = None
+    language: str
+    approved: bool
+    created_by: Optional[int] = None
+    approved_by: Optional[int] = None
+    created_at: Optional[Any] = None
+    approved_at: Optional[Any] = None
+    chunks_count: int = 0
+    qdrant_indexed: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+class KnowledgeDocUpdate(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=1, max_length=300)
+    content: Optional[str] = Field(default=None, min_length=1)
+    category: Optional[str] = None
+    language: Optional[str] = None
+
+
+class KnowledgeBulkDelete(BaseModel):
+    ids: List[int] = Field(default_factory=list, min_length=1)
+
+
+class KnowledgeStats(BaseModel):
+    total: int
+    approved: int
+    drafts: int
+    indexed_in_qdrant: int
+    chunks_total: int
+    by_category: Dict[str, int]
+    by_language: Dict[str, int]
+    qdrant: Dict[str, Any]
+
+
+class KnowledgeRetrainReport(BaseModel):
+    attempted: int
+    succeeded: int
+    failed: int
+    chunks_total: int
+    failed_ids: List[int] = Field(default_factory=list)
+
+
+class KnowledgeChatRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=4000)
+    top_k: Optional[int] = Field(default=5, ge=1, le=20)
+
+
+class KnowledgeUsedChunk(BaseModel):
+    doc_id: Optional[int] = None
+    title: Optional[str] = None
+    chunk_index: Optional[int] = None
+    text: str
+    score: float
+    approved: bool
+
+
+class KnowledgeChatResponse(BaseModel):
+    answer: str
+    role_seen: str
+    # "rag" (default) for RAG answers; otherwise the executed command name
+    # (save / list_drafts / approve / reject / reindex / status / my_drafts).
+    action: Optional[str] = "rag"
+    # Optional structured payload for admin/chat-driven actions (e.g. a
+    # list of draft summaries, or the affected ``doc_id``).
+    data: Optional[Any] = None
+    # Populated only for SuperAdmin (testing mode)
+    sources: Optional[List[Dict[str, Any]]] = None
+    confidence: Optional[float] = None
+    used_chunks: Optional[List[KnowledgeUsedChunk]] = None

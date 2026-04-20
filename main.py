@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 import database
 import schemas
 import logic
+from api.knowledge import router as knowledge_router
 
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BACKEND_DIR.parent
@@ -229,13 +230,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Role-based RAG knowledge-base API (/knowledge/*).
+app.include_router(knowledge_router)
+
 # app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media") # Unsecured mount removed
 
 
 @app.on_event("startup")
-def startup():
+async def startup():
     if database.DATABASE_URL.startswith("sqlite"):
         database.init_db()
+
+    # Capture the running event loop so sync handlers can schedule
+    # per-user WebSocket pushes via ``NotificationHub``.
+    try:
+        from utils.notifications import hub as _notif_hub
+        _notif_hub.set_loop(asyncio.get_running_loop())
+    except Exception as exc:
+        logger.warning(f"Notification hub loop binding failed: {exc}")
     # Ensure media directories exist (prevents 500 when saving uploads on fresh deploys)
     try:
         MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -737,7 +749,12 @@ def get_chat_history(db: Session = Depends(get_db), _: database.User = Depends(r
     return db.query(ChatMessage).order_by(ChatMessage.id.asc()).all()
 
 @app.post("/chat/")
-def add_chat_message(msg: schemas.ChatMessageCreate, db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
+def add_chat_message(
+    msg: schemas.ChatMessageCreate,
+    generate_reply: bool = False,
+    db: Session = Depends(get_db),
+    _: database.User = Depends(require_admin),
+):
     import datetime as dt
     import threading
 
@@ -753,22 +770,43 @@ def add_chat_message(msg: schemas.ChatMessageCreate, db: Session = Depends(get_d
 
     user_msg = {"id": db_msg.id, "role": db_msg.role, "content": db_msg.content, "timestamp": db_msg.timestamp}
 
-    # If user message, generate AI response in background
-    if msg.role == "user":
+    # Generate assistant reply only when the caller explicitly asks for it.
+    if msg.role == "user" and generate_reply:
         def generate_ai_reply():
             ai_db = SessionLocal()
             try:
                 # Build context from recent messages
                 recent = ai_db.query(ChatMessage).order_by(ChatMessage.id.desc()).limit(10).all()
                 context = "\n".join([f"{m.role}: {m.content}" for m in reversed(recent)])
+                insights_setting = ai_db.query(GlobalSetting).filter(GlobalSetting.key == "psychologist_insights").first()
+                filters_setting = ai_db.query(GlobalSetting).filter(GlobalSetting.key == "global_filters").first()
 
-                # Get AI response via Mistral
+                saved_insights = insights_setting.value if insights_setting and isinstance(insights_setting.value, list) else []
+                active_filters = filters_setting.value if filters_setting and isinstance(filters_setting.value, list) else []
+
+                filters_block = (
+                    "Активные требования:\n- " + "\n- ".join(active_filters[:8])
+                    if active_filters
+                    else "Активные требования пока не заданы."
+                )
+                insights_block = (
+                    "Сохранённые инсайты:\n- " + "\n- ".join(saved_insights[:8])
+                    if saved_insights
+                    else "Сохранённых инсайтов пока нет."
+                )
+                prompt = (
+                    "Ты внутренний AI-психолог платформы интервью.\n"
+                    "Отвечай профессионально, кратко и практично.\n"
+                    "Делай акцент на методологии оценки кандидата, поведенческих сигналах, рисках и улучшении процесса интервью.\n\n"
+                    f"{filters_block}\n\n"
+                    f"{insights_block}\n\n"
+                    f"Недавний контекст диалога:\n{context}\n\n"
+                    f"Запрос психолога:\n{msg.content}"
+                )
+
+                # Get AI response via the configured provider.
                 try:
-                    ai_text = logic.analyze_answer(
-                        question=msg.content,
-                        answer=context,
-                        context="Ты — AI-ассистент психолога-методолога. Отвечай на русском языке. Анализируй поведение кандидатов, давай рекомендации по методологии интервью."
-                    )
+                    ai_text = logic.ask_mistral_raw(prompt)
                 except Exception:
                     ai_text = "AI сервер временно недоступен. Попробуйте позже."
 
@@ -788,6 +826,11 @@ def add_chat_message(msg: schemas.ChatMessageCreate, db: Session = Depends(get_d
         thread.start()
 
     return user_msg
+
+
+@app.get("/logic/provider-status/")
+def ai_provider_status(_: database.User = Depends(require_admin)):
+    return logic.get_ai_runtime_status()
 
 
 @app.delete("/chat/")
@@ -1256,6 +1299,46 @@ async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = None):
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+
+@app.websocket("/ws/notifications")
+async def notifications_websocket(websocket: WebSocket, token: Optional[str] = None):
+    """Per-user notification stream. JWT is passed as ``?token=...`` query param."""
+    if not token:
+        await websocket.close(code=4001)
+        return
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        if not email:
+            await websocket.close(code=4001)
+            return
+    except JWTError:
+        await websocket.close(code=4001)
+        return
+
+    with SessionLocal() as db:
+        user = db.query(database.User).filter_by(email=email).first()
+        if not user or not user.is_active:
+            await websocket.close(code=4003)
+            return
+        user_id = user.id
+
+    from utils.notifications import hub as _notif_hub
+    await websocket.accept()
+    await _notif_hub.register(user_id, websocket)
+    try:
+        # Initial hello so the client can confirm the stream is live.
+        await websocket.send_json({"type": "ready", "user_id": user_id})
+        while True:
+            # Keep-alive loop — client may send pings, we don't care about content.
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.warning(f"[notifications_ws] error for user={user_id}: {exc}")
+    finally:
+        _notif_hub.unregister(user_id, websocket)
+
 
 @app.websocket("/ws/webrtc/{candidate_id}")
 async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optional[str] = None):

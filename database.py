@@ -116,6 +116,25 @@ class GlobalSetting(Base):
     key = Column(String, primary_key=True)
     value = Column(JSON)
 
+
+class KnowledgeDocument(Base):
+    __tablename__ = "knowledge_documents"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+    source_type = Column(String, default="text")  # "text" | "file"
+    source_name = Column(String, nullable=True)
+    category = Column(String, nullable=True, index=True)
+    language = Column(String, default="uz", index=True)
+    approved = Column(Boolean, default=False, index=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    approved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    approved_at = Column(DateTime, nullable=True)
+    chunks_count = Column(Integer, default=0)
+    qdrant_indexed = Column(Boolean, default=False)
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
 
