@@ -17,7 +17,7 @@ from __future__ import annotations
 import datetime
 import logging
 import os
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.security import OAuth2PasswordBearer
@@ -76,13 +76,13 @@ def _require_authenticated(user: Optional[database.User] = Depends(_current_user
 
 def _require_knowledge_writer(user: database.User = Depends(_require_authenticated)):
     if not kb.can_add_knowledge(user.role):
-        raise HTTPException(status_code=403, detail="Faqat psixolog yoki super-admin bilim qo'shishi mumkin")
+        raise HTTPException(status_code=403, detail="Добавлять знания могут только психолог или SuperAdmin")
     return user
 
 
 def _require_super_admin(user: database.User = Depends(_require_authenticated)):
     if not kb.is_super_admin(user.role):
-        raise HTTPException(status_code=403, detail="Faqat SuperAdmin uchun")
+        raise HTTPException(status_code=403, detail="Доступно только SuperAdmin")
     return user
 
 
@@ -114,7 +114,7 @@ def _notify_draft_submitted(db: Session, doc: database.KnowledgeDocument, author
     notif_svc.notify_role(
         db,
         role=kb.ROLE_SUPER_ADMIN,
-        title="Yangi draft bilim qo'shildi",
+        title="Новый черновик базы знаний",
         message=f"{author.name or author.email}: «{doc.title}»",
         type="info",
         meta={"event": "knowledge.draft.created", "doc_id": doc.id, "author_id": author.id},
@@ -127,8 +127,8 @@ def _notify_approved(db: Session, doc: database.KnowledgeDocument) -> None:
     notif_svc.notify_user(
         db,
         doc.created_by,
-        title="Draft tasdiqlandi",
-        message=f"«{doc.title}» tasdiqlandi va bilimlar bazasiga qo'shildi.",
+        title="Черновик подтверждён",
+        message=f"«{doc.title}» подтверждён и добавлен в базу знаний.",
         type="success",
         meta={"event": "knowledge.approved", "doc_id": doc.id},
     )
@@ -137,13 +137,13 @@ def _notify_approved(db: Session, doc: database.KnowledgeDocument) -> None:
 def _notify_rejected(db: Session, doc: database.KnowledgeDocument, reason: Optional[str] = None) -> None:
     if not doc.created_by:
         return
-    msg = f"«{doc.title}» rad etildi yoki o'chirildi."
+    msg = f"«{doc.title}» отклонён или удалён."
     if reason:
-        msg += f" Sabab: {reason}"
+        msg += f" Причина: {reason}"
     notif_svc.notify_user(
         db,
         doc.created_by,
-        title="Draft rad etildi",
+        title="Черновик отклонён",
         message=msg,
         type="warning",
         meta={"event": "knowledge.rejected", "doc_id": doc.id},
@@ -191,17 +191,17 @@ async def upload_knowledge_file(
     filename = (file.filename or "").strip()
     ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if ext not in ALLOWED_EXTS:
-        raise HTTPException(status_code=415, detail=f"Qo'llab-quvvatlanmaydigan format: {ext or '?'}")
+        raise HTTPException(status_code=415, detail=f"Неподдерживаемый формат: {ext or '?'}")
 
     data = await file.read()
     if not data:
-        raise HTTPException(status_code=400, detail="Bo'sh fayl")
+        raise HTTPException(status_code=400, detail="Пустой файл")
     if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="Fayl juda katta (>10 MB)")
+        raise HTTPException(status_code=413, detail="Файл слишком большой (>10 МБ)")
 
     text = kb.extract_text_from_upload(filename, data).strip()
     if not text:
-        raise HTTPException(status_code=422, detail="Fayldan matn ajratib bo'lmadi")
+        raise HTTPException(status_code=422, detail="Не удалось извлечь текст из файла")
 
     doc = database.KnowledgeDocument(
         title=(title or filename).strip()[:300],
@@ -232,7 +232,7 @@ def list_knowledge(
     """List documents. Psychologists see their own drafts + all approved docs.
     SuperAdmin sees everything. Regular users are forbidden from listing."""
     if (user.role or "").lower() == kb.ROLE_USER.lower():
-        raise HTTPException(status_code=403, detail="Oddiy foydalanuvchilar uchun ruxsat yo'q")
+        raise HTTPException(status_code=403, detail="Для обычных пользователей доступ закрыт")
 
     q = db.query(database.KnowledgeDocument)
 
@@ -260,14 +260,14 @@ def get_knowledge(
 ):
     doc = db.query(database.KnowledgeDocument).get(doc_id)
     if not doc:
-        raise HTTPException(status_code=404, detail="Hujjat topilmadi")
+        raise HTTPException(status_code=404, detail="Документ не найден")
 
     if not kb.is_super_admin(user.role):
         if (user.role or "").lower() == kb.ROLE_USER.lower():
-            raise HTTPException(status_code=403, detail="Ruxsat yo'q")
+            raise HTTPException(status_code=403, detail="Нет доступа")
         # Psychologist: own drafts + approved only
         if not doc.approved and doc.created_by != user.id:
-            raise HTTPException(status_code=403, detail="Bu hujjatga ruxsat yo'q")
+            raise HTTPException(status_code=403, detail="К этому документу нет доступа")
 
     return _serialize(doc)
 
@@ -281,7 +281,7 @@ def approve_knowledge(
     """SuperAdmin approves a draft and triggers Qdrant indexing (training)."""
     doc = db.query(database.KnowledgeDocument).get(doc_id)
     if not doc:
-        raise HTTPException(status_code=404, detail="Hujjat topilmadi")
+        raise HTTPException(status_code=404, detail="Документ не найден")
 
     doc.approved = True
     doc.approved_by = admin.id
@@ -305,7 +305,7 @@ def unapprove_knowledge(
     """Revoke approval. Keeps chunks in Qdrant but flips their ``approved`` payload."""
     doc = db.query(database.KnowledgeDocument).get(doc_id)
     if not doc:
-        raise HTTPException(status_code=404, detail="Hujjat topilmadi")
+        raise HTTPException(status_code=404, detail="Документ не найден")
 
     doc.approved = False
     doc.approved_by = None
@@ -314,7 +314,7 @@ def unapprove_knowledge(
     db.refresh(doc)
 
     kb.update_document_approval(doc.id, approved=False)
-    _notify_rejected(db, doc, reason="Tasdiq bekor qilindi")
+    _notify_rejected(db, doc, reason="Подтверждение отменено")
     return _serialize(doc)
 
 
@@ -327,7 +327,7 @@ def reindex_knowledge(
     """Force re-chunk + re-embed + re-upsert. Useful after content edits or Qdrant restore."""
     doc = db.query(database.KnowledgeDocument).get(doc_id)
     if not doc:
-        raise HTTPException(status_code=404, detail="Hujjat topilmadi")
+        raise HTTPException(status_code=404, detail="Документ не найден")
     _reindex(doc, db=db)
     return _serialize(doc)
 
@@ -370,10 +370,10 @@ def reindex_all(
     notif_svc.notify_user(
         db,
         admin.id,
-        title="Qayta train yakunlandi",
+        title="Переобучение завершено",
         message=(
-            f"Urinish: {report.attempted} • Muvaffaqiyatli: {report.succeeded} "
-            f"• Xato: {report.failed} • Jami chunk: {report.chunks_total}"
+            f"Попыток: {report.attempted} • Успешно: {report.succeeded} "
+            f"• Ошибок: {report.failed} • Всего фрагментов: {report.chunks_total}"
         ),
         type="success" if report.failed == 0 else "warning",
         meta={"event": "knowledge.retrained", **report.model_dump()},
@@ -392,13 +392,13 @@ def update_knowledge(
     If content changes on an approved doc, Qdrant is re-indexed automatically."""
     doc = db.query(database.KnowledgeDocument).get(doc_id)
     if not doc:
-        raise HTTPException(status_code=404, detail="Hujjat topilmadi")
+        raise HTTPException(status_code=404, detail="Документ не найден")
 
     if not kb.is_super_admin(user.role):
         if not kb.can_add_knowledge(user.role):
-            raise HTTPException(status_code=403, detail="Ruxsat yo'q")
+            raise HTTPException(status_code=403, detail="Нет доступа")
         if doc.created_by != user.id or doc.approved:
-            raise HTTPException(status_code=403, detail="Faqat o'z draft hujjatingizni tahrirlay olasiz")
+            raise HTTPException(status_code=403, detail="Редактировать можно только свои черновики")
 
     changed_content = False
     if payload.title is not None and payload.title.strip() != doc.title:
@@ -433,7 +433,7 @@ def bulk_delete_knowledge(
 ):
     """SuperAdmin: delete many documents in one call. Drops Qdrant chunks too."""
     if not payload.ids:
-        raise HTTPException(status_code=400, detail="Hech qanday ID berilmadi")
+        raise HTTPException(status_code=400, detail="Не указаны ID")
 
     deleted = 0
     not_found: List[int] = []
@@ -456,12 +456,12 @@ def bulk_delete_knowledge(
 
     for author_id, docs in affected_authors.items():
         titles = ", ".join(f"«{d['title']}»" for d in docs[:3])
-        more = f" va yana {len(docs) - 3}" if len(docs) > 3 else ""
+        more = f" и ещё {len(docs) - 3}" if len(docs) > 3 else ""
         notif_svc.notify_user(
             db,
             author_id,
-            title="Hujjatlaringiz o'chirildi",
-            message=f"SuperAdmin o'chirdi: {titles}{more}",
+            title="Ваши документы удалены",
+            message=f"SuperAdmin удалил: {titles}{more}",
             type="warning",
             meta={"event": "knowledge.bulk_deleted", "docs": docs},
         )
@@ -517,14 +517,14 @@ def delete_knowledge(
 ):
     doc = db.query(database.KnowledgeDocument).get(doc_id)
     if not doc:
-        raise HTTPException(status_code=404, detail="Hujjat topilmadi")
+        raise HTTPException(status_code=404, detail="Документ не найден")
 
     # SuperAdmin can delete anything; Psychologist only their own *drafts*.
     if not kb.is_super_admin(user.role):
         if not kb.can_add_knowledge(user.role):
-            raise HTTPException(status_code=403, detail="Ruxsat yo'q")
+            raise HTTPException(status_code=403, detail="Нет доступа")
         if doc.created_by != user.id or doc.approved:
-            raise HTTPException(status_code=403, detail="Faqat o'z draft hujjatingizni o'chira olasiz")
+            raise HTTPException(status_code=403, detail="Удалить можно только свои черновики")
 
     kb.delete_document_points(doc.id)
     # Snapshot primitives before deletion so the notification still has values
@@ -539,8 +539,8 @@ def delete_knowledge(
         notif_svc.notify_user(
             db,
             snap_author,
-            title="Draft rad etildi",
-            message=f"«{snap_title}» SuperAdmin tomonidan o'chirildi.",
+            title="Черновик отклонён",
+            message=f"«{snap_title}» удалён SuperAdmin.",
             type="warning",
             meta={"event": "knowledge.rejected", "doc_id": snap_id},
         )
@@ -563,8 +563,8 @@ def _chat_save(
     db.refresh(doc)
     _notify_draft_submitted(db, doc, user)
     answer = (
-        f"✅ Draft saqlandi (ID: {doc.id}, «{doc.title}»). "
-        "SuperAdmin tasdiqlashini kuting."
+        f"✅ Черновик сохранён (ID: {doc.id}, «{doc.title}»). "
+        "Ожидайте подтверждения от SuperAdmin."
     )
     return schemas.KnowledgeChatResponse(
         answer=answer, role_seen=user.role or "", action="save", data={"doc_id": doc.id}
@@ -580,10 +580,10 @@ def _chat_list_drafts(
     drafts = q.order_by(database.KnowledgeDocument.created_at.desc()).limit(50).all()
 
     if not drafts:
-        text = "Hozircha draft hujjatlar yo'q."
+        text = "Нет черновиков."
     else:
-        lines = [f"#{d.id} — «{d.title}» ({d.category or 'umumiy'})" for d in drafts]
-        text = f"Kutilayotgan draftlar ({len(drafts)}):\n" + "\n".join(lines)
+        lines = [f"#{d.id} — «{d.title}» ({d.category or 'общее'})" for d in drafts]
+        text = f"Ожидают проверки ({len(drafts)}):\n" + "\n".join(lines)
 
     return schemas.KnowledgeChatResponse(
         answer=text,
@@ -600,11 +600,11 @@ def _chat_approve(db: Session, admin: database.User, doc_id: int) -> schemas.Kno
     doc = db.query(database.KnowledgeDocument).get(doc_id)
     if not doc:
         return schemas.KnowledgeChatResponse(
-            answer=f"❌ #{doc_id} topilmadi.", role_seen=admin.role or "", action="approve"
+            answer=f"❌ #{doc_id} не найден.", role_seen=admin.role or "", action="approve"
         )
     if doc.approved:
         return schemas.KnowledgeChatResponse(
-            answer=f"ℹ️ #{doc.id} allaqachon tasdiqlangan.",
+            answer=f"ℹ️ #{doc.id} уже подтверждён.",
             role_seen=admin.role or "",
             action="approve",
             data={"doc_id": doc.id},
@@ -620,11 +620,11 @@ def _chat_approve(db: Session, admin: database.User, doc_id: int) -> schemas.Kno
 
     extra = ""
     if doc.qdrant_indexed:
-        extra = f" Qdrantga {doc.chunks_count} chunk yuklandi."
+        extra = f" В Qdrant загружено {doc.chunks_count} фрагментов."
     else:
-        extra = " (Qdrant offlayn — keyinroq reindex kerak.)"
+        extra = " (Qdrant офлайн — потребуется повторная индексация.)"
     return schemas.KnowledgeChatResponse(
-        answer=f"✅ #{doc.id} «{doc.title}» tasdiqlandi.{extra}",
+        answer=f"✅ #{doc.id} «{doc.title}» подтверждён.{extra}",
         role_seen=admin.role or "",
         action="approve",
         data={"doc_id": doc.id, "qdrant_indexed": doc.qdrant_indexed, "chunks": doc.chunks_count},
@@ -635,7 +635,7 @@ def _chat_reject(db: Session, admin: database.User, doc_id: int) -> schemas.Know
     doc = db.query(database.KnowledgeDocument).get(doc_id)
     if not doc:
         return schemas.KnowledgeChatResponse(
-            answer=f"❌ #{doc_id} topilmadi.", role_seen=admin.role or "", action="reject"
+            answer=f"❌ #{doc_id} не найден.", role_seen=admin.role or "", action="reject"
         )
 
     snap_title, snap_author, snap_id = doc.title, doc.created_by, doc.id
@@ -647,13 +647,13 @@ def _chat_reject(db: Session, admin: database.User, doc_id: int) -> schemas.Know
         notif_svc.notify_user(
             db,
             snap_author,
-            title="Draft rad etildi",
-            message=f"«{snap_title}» SuperAdmin tomonidan rad etildi.",
+            title="Черновик отклонён",
+            message=f"«{snap_title}» отклонён SuperAdmin.",
             type="warning",
             meta={"event": "knowledge.rejected", "doc_id": snap_id},
         )
     return schemas.KnowledgeChatResponse(
-        answer=f"🗑 #{snap_id} «{snap_title}» o'chirildi.",
+        answer=f"🗑 #{snap_id} «{snap_title}» удалён.",
         role_seen=admin.role or "",
         action="reject",
         data={"doc_id": snap_id},
@@ -664,12 +664,12 @@ def _chat_reindex(db: Session, admin: database.User, doc_id: int) -> schemas.Kno
     doc = db.query(database.KnowledgeDocument).get(doc_id)
     if not doc:
         return schemas.KnowledgeChatResponse(
-            answer=f"❌ #{doc_id} topilmadi.", role_seen=admin.role or "", action="reindex"
+            answer=f"❌ #{doc_id} не найден.", role_seen=admin.role or "", action="reindex"
         )
     _reindex(doc, db=db)
-    status = "muvaffaqiyatli" if doc.qdrant_indexed else "muvaffaqiyatsiz (Qdrant offlayn)"
+    status = "успешно" if doc.qdrant_indexed else "не удалось (Qdrant офлайн)"
     return schemas.KnowledgeChatResponse(
-        answer=f"🔁 #{doc.id} reindex {status}. Chunks: {doc.chunks_count}.",
+        answer=f"🔁 #{doc.id} переиндексация {status}. Фрагментов: {doc.chunks_count}.",
         role_seen=admin.role or "",
         action="reindex",
         data={"doc_id": doc.id, "qdrant_indexed": doc.qdrant_indexed, "chunks": doc.chunks_count},
@@ -682,7 +682,7 @@ def _chat_edit(
     doc = db.query(database.KnowledgeDocument).get(doc_id)
     if not doc:
         return schemas.KnowledgeChatResponse(
-            answer=f"❌ #{doc_id} topilmadi.", role_seen=admin.role or "", action="edit"
+            answer=f"❌ #{doc_id} не найден.", role_seen=admin.role or "", action="edit"
         )
 
     changed_content = False
@@ -699,15 +699,15 @@ def _chat_edit(
     if doc.approved:
         if changed_content:
             _reindex(doc, db=db)
-            note = f"Qdrantda qayta indekslandi ({doc.chunks_count} chunk)."
+            note = f"Переиндексировано в Qdrant ({doc.chunks_count} фрагментов)."
         else:
             kb.update_document_approval(doc.id, approved=True)
-            note = "Kontent o'zgarmagani uchun reindex qilinmadi."
+            note = "Содержимое не изменилось — повторная индексация не требуется."
     else:
-        note = "Draft holatida — tasdiqlash uchun `approve` buyrug'ini ishlating."
+        note = "В статусе черновика — для публикации используйте команду `подтвердить`."
 
     return schemas.KnowledgeChatResponse(
-        answer=f"✏️ #{doc.id} «{doc.title}» yangilandi. {note}",
+        answer=f"✏️ #{doc.id} «{doc.title}» обновлён. {note}",
         role_seen=admin.role or "",
         action="edit",
         data={"doc_id": doc.id, "qdrant_indexed": doc.qdrant_indexed, "chunks": doc.chunks_count},
@@ -719,21 +719,21 @@ def _chat_retrain(db: Session, admin: database.User) -> schemas.KnowledgeChatRes
     notif_svc.notify_user(
         db,
         admin.id,
-        title="Qayta train yakunlandi",
+        title="Переобучение завершено",
         message=(
-            f"Urinish: {report.attempted} • Muvaffaqiyatli: {report.succeeded} "
-            f"• Xato: {report.failed} • Jami chunk: {report.chunks_total}"
+            f"Попыток: {report.attempted} • Успешно: {report.succeeded} "
+            f"• Ошибок: {report.failed} • Всего фрагментов: {report.chunks_total}"
         ),
         type="success" if report.failed == 0 else "warning",
         meta={"event": "knowledge.retrained", **report.model_dump()},
     )
     text = (
-        f"🚂 Qayta train yakunlandi.\n"
-        f"Urinish: {report.attempted}\n"
-        f"Muvaffaqiyatli: {report.succeeded}\n"
-        f"Xato: {report.failed}"
+        f"🚂 Переобучение завершено.\n"
+        f"Попыток: {report.attempted}\n"
+        f"Успешно: {report.succeeded}\n"
+        f"Ошибок: {report.failed}"
         f"{' (' + ', '.join('#' + str(i) for i in report.failed_ids) + ')' if report.failed_ids else ''}\n"
-        f"Jami chunk: {report.chunks_total}"
+        f"Всего фрагментов: {report.chunks_total}"
     )
     return schemas.KnowledgeChatResponse(
         answer=text, role_seen=admin.role or "", action="retrain", data=report.model_dump()
@@ -745,11 +745,11 @@ def _chat_stats(db: Session, admin: database.User) -> schemas.KnowledgeChatRespo
     cat_lines = "\n".join(f"  • {k}: {v}" for k, v in sorted(s.by_category.items(), key=lambda x: -x[1])[:10])
     lang_lines = ", ".join(f"{k}:{v}" for k, v in s.by_language.items())
     text = (
-        f"📊 Bilimlar bazasi:\n"
-        f"Jami: {s.total}  |  Tasdiqlangan: {s.approved}  |  Draft: {s.drafts}\n"
-        f"Qdrantda: {s.indexed_in_qdrant}  |  Chunklar: {s.chunks_total}\n"
-        f"Tillar: {lang_lines or '—'}\n"
-        f"Kategoriyalar:\n{cat_lines or '  —'}"
+        f"📊 База знаний:\n"
+        f"Всего: {s.total}  |  Подтверждено: {s.approved}  |  Черновики: {s.drafts}\n"
+        f"В Qdrant: {s.indexed_in_qdrant}  |  Фрагментов: {s.chunks_total}\n"
+        f"Языки: {lang_lines or '—'}\n"
+        f"Категории:\n{cat_lines or '  —'}"
     )
     return schemas.KnowledgeChatResponse(
         answer=text, role_seen=admin.role or "", action="stats", data=s.model_dump()
@@ -769,10 +769,10 @@ def _chat_search(db: Session, user: database.User, query: str) -> schemas.Knowle
         )
     docs = q.order_by(database.KnowledgeDocument.created_at.desc()).limit(25).all()
     if not docs:
-        text = f"«{query}» bo'yicha hech narsa topilmadi."
+        text = f"По запросу «{query}» ничего не найдено."
     else:
         lines = [f"#{d.id} — «{d.title}» ({'✅' if d.approved else '📝'})" for d in docs]
-        text = f"Topildi: {len(docs)}\n" + "\n".join(lines)
+        text = f"Найдено: {len(docs)}\n" + "\n".join(lines)
     return schemas.KnowledgeChatResponse(
         answer=text,
         role_seen=user.role or "",
@@ -785,24 +785,24 @@ def _chat_get(db: Session, user: database.User, doc_id: int) -> schemas.Knowledg
     doc = db.query(database.KnowledgeDocument).get(doc_id)
     if not doc:
         return schemas.KnowledgeChatResponse(
-            answer=f"❌ #{doc_id} topilmadi.", role_seen=user.role or "", action="get"
+            answer=f"❌ #{doc_id} не найден.", role_seen=user.role or "", action="get"
         )
     if not kb.is_super_admin(user.role):
         if (user.role or "").lower() == kb.ROLE_USER.lower():
             return schemas.KnowledgeChatResponse(
-                answer="Ruxsat yo'q.", role_seen=user.role or "", action="get"
+                answer="Нет доступа.", role_seen=user.role or "", action="get"
             )
         if not doc.approved and doc.created_by != user.id:
             return schemas.KnowledgeChatResponse(
-                answer="Bu hujjatga ruxsat yo'q.", role_seen=user.role or "", action="get"
+                answer="К этому документу нет доступа.", role_seen=user.role or "", action="get"
             )
 
     status_icon = "✅" if doc.approved else "📝"
     preview = (doc.content or "")[:600] + ("…" if len(doc.content or "") > 600 else "")
     text = (
         f"{status_icon} #{doc.id} «{doc.title}»\n"
-        f"Kategoriya: {doc.category or 'umumiy'}  |  Til: {doc.language or '?'}  |  "
-        f"Chunk: {doc.chunks_count}\n\n{preview}"
+        f"Категория: {doc.category or 'общее'}  |  Язык: {doc.language or '?'}  |  "
+        f"Фрагментов: {doc.chunks_count}\n\n{preview}"
     )
     return schemas.KnowledgeChatResponse(
         answer=text,
@@ -829,7 +829,7 @@ def _chat_delete_all_drafts(db: Session, admin: database.User) -> schemas.Knowle
     )
     if not drafts:
         return schemas.KnowledgeChatResponse(
-            answer="Draft yo'q — hech narsa o'chirilmadi.",
+            answer="Черновиков нет — удалять нечего.",
             role_seen=admin.role or "",
             action="delete_all_drafts",
         )
@@ -846,18 +846,18 @@ def _chat_delete_all_drafts(db: Session, admin: database.User) -> schemas.Knowle
 
     for author_id, items in affected.items():
         titles = ", ".join(f"«{x['title']}»" for x in items[:3])
-        more = f" va yana {len(items) - 3}" if len(items) > 3 else ""
+        more = f" и ещё {len(items) - 3}" if len(items) > 3 else ""
         notif_svc.notify_user(
             db,
             author_id,
-            title="Draftlaringiz o'chirildi",
-            message=f"SuperAdmin barcha draftlarni tozaladi: {titles}{more}",
+            title="Ваши черновики удалены",
+            message=f"SuperAdmin очистил все черновики: {titles}{more}",
             type="warning",
             meta={"event": "knowledge.drafts_purged", "docs": items},
         )
 
     return schemas.KnowledgeChatResponse(
-        answer=f"🗑 {len(drafts)} ta draft o'chirildi.",
+        answer=f"🗑 Удалено черновиков: {len(drafts)}.",
         role_seen=admin.role or "",
         action="delete_all_drafts",
         data=snapshots,
@@ -869,10 +869,10 @@ def _chat_status(admin: database.User) -> schemas.KnowledgeChatResponse:
     from utils import rag_langchain as lc
 
     info = get_collection_info()
-    backend = "LangChain" if lc.is_available() else "direct HTTP"
+    backend = "LangChain" if lc.is_available() else "прямой HTTP"
     text = (
         f"Qdrant: {info.get('status')} — {info.get('collection', '?')}, "
-        f"points: {info.get('points_count', 0)}. Chat backend: {backend}."
+        f"точек: {info.get('points_count', 0)}. Бэкенд чата: {backend}."
     )
     return schemas.KnowledgeChatResponse(
         answer=text, role_seen=admin.role or "", action="status", data=info

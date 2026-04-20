@@ -282,22 +282,22 @@ def search_knowledge(
 
 # --- Prompting ---------------------------------------------------------------
 
-SYSTEM_PROMPT_UZ = """Sen mijozga yordam beruvchi empatik psixologik yordamchisan.
+SYSTEM_PROMPT_UZ = """Ты — эмпатичный психологический ассистент, помогающий клиенту.
 
-QATTIQ QOIDALAR:
-- Hech qachon aniq diagnoz qo'yma ("sizda depressiya bor" kabi gaplar taqiqlanadi).
-- Hech qachon dori tavsiya qilma.
-- Xavfli holat (o'z joniga qasd qilish, boshqalarga zarar, zo'ravonlik belgilari) sezilsa, darhol jonli mutaxassis yoki tezkor xizmatga murojaat qilishni tavsiya qil.
-- Faqat quyida berilgan KONTEKSTga tayan. Agar kontekstda kerakli ma'lumot yo'q bo'lsa, aynan shu iborani javob qil: "Bu savol uchun yetarli ma'lumot topilmadi".
-- Taxmin qilma, ma'lumotni o'zingdan to'qib qo'shma.
+СТРОГИЕ ПРАВИЛА:
+- Никогда не ставь конкретный диагноз (фразы вида «у вас депрессия» запрещены).
+- Никогда не назначай лекарства.
+- Если видишь признаки опасной ситуации (суицидальные мысли, угроза другим, признаки насилия) — сразу рекомендуй обратиться к живому специалисту или в экстренную службу.
+- Опирайся только на КОНТЕКСТ, указанный ниже. Если в контексте нет нужной информации, ответь ровно этой фразой: "Недостаточно данных для ответа на этот вопрос".
+- Не домысливай и не придумывай факты.
 
-USLUB:
-- Oddiy, insoniy, iliq til. Og'ir ilmiy jargon ishlatma.
-- Qisqa va aniq javob ber.
-- Javobni quyidagi tuzilma bo'yicha ber:
-  1) Muammoni qisqa tushuntir.
-  2) Mumkin bo'lgan sabablar.
-  3) Amaliy maslahat / qadamlar.
+СТИЛЬ:
+- Простой, человечный, тёплый язык. Избегай тяжёлого научного жаргона.
+- Отвечай кратко и по существу.
+- Придерживайся следующей структуры ответа:
+  1) Коротко опиши проблему.
+  2) Возможные причины.
+  3) Практические советы / шаги.
 """
 
 
@@ -305,25 +305,25 @@ def _build_user_prompt(query: str, chunks: List[Dict[str, Any]]) -> str:
     if chunks:
         ctx_lines = []
         for i, c in enumerate(chunks, 1):
-            title = c.get("title") or "Manba"
+            title = c.get("title") or "Источник"
             ctx_lines.append(f"[{i}] ({title})\n{c.get('text', '').strip()}")
         context_block = "\n\n".join(ctx_lines)
     else:
-        context_block = "(kontekst topilmadi)"
+        context_block = "(контекст не найден)"
 
     return (
-        "KONTEKST (tasdiqlangan bilimlar bazasidan olingan parchalar):\n"
+        "КОНТЕКСТ (фрагменты из подтверждённой базы знаний):\n"
         f"{context_block}\n\n"
-        "FOYDALANUVCHI SAVOLI:\n"
+        "ВОПРОС ПОЛЬЗОВАТЕЛЯ:\n"
         f"{query}\n\n"
-        "Yuqoridagi qoidalarga qat'iy rioya qilgan holda javob ber."
+        "Ответь, строго соблюдая правила выше."
     )
 
 
 # --- LLM call ----------------------------------------------------------------
 
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
-FALLBACK_NO_CONTEXT = "Bu savol uchun yetarli ma'lumot topilmadi"
+FALLBACK_NO_CONTEXT = "Недостаточно данных для ответа на этот вопрос"
 
 
 def ask_mistral(query: str, chunks: List[Dict[str, Any]], *, timeout: int = 45) -> str:
@@ -495,45 +495,64 @@ class Intent:
 #   delete_all_drafts — admin: wipe all un-approved drafts
 
 
+# Command verbs (uz / en / ru). Each regex accepts all three so users can type
+# in whichever language feels natural.
 _RE_APPROVE = re.compile(
-    r"^\s*(?:/approve|approve|tasdiqla)\s+#?(\d+)\s*$|^\s*#?(\d+)\s+(?:ni\s+)?(?:tasdiqla|approve)\s*$",
-    re.IGNORECASE,
+    r"^\s*(?:/approve|approve|tasdiqla|одобри(?:ть)?|подтверди(?:ть)?)\s+#?(\d+)\s*$|"
+    r"^\s*#?(\d+)\s+(?:ni\s+)?(?:tasdiqla|approve|одобри(?:ть)?|подтверди(?:ть)?)\s*$",
+    re.IGNORECASE | re.UNICODE,
 )
 _RE_REJECT = re.compile(
-    r"^\s*(?:/reject|reject|rad\s*et|o'?chir|delete)\s+#?(\d+)\s*$|^\s*#?(\d+)\s+(?:ni\s+)?(?:rad\s*et|o'?chir|reject|delete)\s*$",
-    re.IGNORECASE,
+    r"^\s*(?:/reject|reject|rad\s*et|o'?chir|delete|удали(?:ть)?|отклони(?:ть)?)\s+#?(\d+)\s*$|"
+    r"^\s*#?(\d+)\s+(?:ni\s+)?(?:rad\s*et|o'?chir|reject|delete|удали(?:ть)?|отклони(?:ть)?)\s*$",
+    re.IGNORECASE | re.UNICODE,
 )
 _RE_REINDEX = re.compile(
-    r"^\s*(?:/reindex|reindex|qayta\s+indeksla)\s+#?(\d+)\s*$|^\s*#?(\d+)\s+(?:ni\s+)?(?:reindex|qayta\s+indeksla)\s*$",
-    re.IGNORECASE,
+    r"^\s*(?:/reindex|reindex|qayta\s+indeksla|переиндексируй(?:те)?|переиндексировать)\s+#?(\d+)\s*$|"
+    r"^\s*#?(\d+)\s+(?:ni\s+)?(?:reindex|qayta\s+indeksla|переиндексируй(?:те)?|переиндексировать)\s*$",
+    re.IGNORECASE | re.UNICODE,
 )
 _RE_SAVE = re.compile(
-    r"^\s*(?:/save|save|saqla|eslab\s*qol)\s*[:\-]\s*(.+)$",
-    re.IGNORECASE | re.DOTALL,
+    r"^\s*(?:/save|save|saqla|eslab\s*qol|сохрани(?:ть)?|запомни(?:ть)?|добавь(?:\s+знание)?)\s*[:\-]\s*(.+)$",
+    re.IGNORECASE | re.DOTALL | re.UNICODE,
 )
-_RE_LIST_DRAFTS = re.compile(r"^\s*(?:/drafts|drafts|draftlar|pending|kutilayotgan)\s*$", re.IGNORECASE)
-_RE_MY_DRAFTS = re.compile(r"^\s*(?:/mydrafts|my\s*drafts|mening\s*draftlarim|o'?z\s*draftlarim)\s*$", re.IGNORECASE)
-_RE_STATUS = re.compile(r"^\s*(?:/status|status|qdrant|holat)\s*$", re.IGNORECASE)
-_RE_STATS = re.compile(r"^\s*(?:/stats|stats|statistika|hisobot)\s*$", re.IGNORECASE)
+_RE_LIST_DRAFTS = re.compile(
+    r"^\s*(?:/drafts|drafts|draftlar|pending|kutilayotgan|черновики|ожидают|на\s+проверку)\s*$",
+    re.IGNORECASE | re.UNICODE,
+)
+_RE_MY_DRAFTS = re.compile(
+    r"^\s*(?:/mydrafts|my\s*drafts|mening\s*draftlarim|o'?z\s*draftlarim|мои\s+черновики)\s*$",
+    re.IGNORECASE | re.UNICODE,
+)
+_RE_STATUS = re.compile(
+    r"^\s*(?:/status|status|qdrant|holat|статус|состояние)\s*$",
+    re.IGNORECASE | re.UNICODE,
+)
+_RE_STATS = re.compile(
+    r"^\s*(?:/stats|stats|statistika|hisobot|статистика|отчет|отчёт)\s*$",
+    re.IGNORECASE | re.UNICODE,
+)
 _RE_RETRAIN = re.compile(
-    r"^\s*(?:/retrain|retrain|reindex\s+all|qayta\s+train(?:\s+qil)?|hammani\s+qayta\s+indeksla)\s*$",
-    re.IGNORECASE,
+    r"^\s*(?:/retrain|retrain|reindex\s+all|qayta\s+train(?:\s+qil)?|hammani\s+qayta\s+indeksla|"
+    r"переобучи(?:ть)?|переиндексировать\s+все|переиндексируй\s+все)\s*$",
+    re.IGNORECASE | re.UNICODE,
 )
 _RE_EDIT = re.compile(
-    r"^\s*(?:/edit|edit|tahrirla)\s+#?(\d+)\s*[:\-]\s*(.+)$",
-    re.IGNORECASE | re.DOTALL,
+    r"^\s*(?:/edit|edit|tahrirla|измени(?:ть)?|редактируй(?:те)?|обнови(?:ть)?)\s+#?(\d+)\s*[:\-]\s*(.+)$",
+    re.IGNORECASE | re.DOTALL | re.UNICODE,
 )
 _RE_SEARCH = re.compile(
-    r"^\s*(?:/search|search|qidir|topib\s*ber)\s*[:\-]\s*(.+)$",
-    re.IGNORECASE | re.DOTALL,
+    r"^\s*(?:/search|search|qidir|topib\s*ber|найди(?:те)?|поиск|искать)\s*[:\-]\s*(.+)$",
+    re.IGNORECASE | re.DOTALL | re.UNICODE,
 )
 _RE_GET = re.compile(
-    r"^\s*(?:/get|get|show|ko'?rsat|ochib\s*ber)\s+#?(\d+)\s*$",
-    re.IGNORECASE,
+    r"^\s*(?:/get|get|show|ko'?rsat|ochib\s*ber|покажи(?:те)?|показать|открой|открыть)\s+#?(\d+)\s*$",
+    re.IGNORECASE | re.UNICODE,
 )
 _RE_DELETE_ALL_DRAFTS = re.compile(
-    r"^\s*(?:/deldrafts|delete\s+all\s+drafts|hamma\s+draftlarni\s+o'?chir|draftlarni\s+o'?chir)\s*$",
-    re.IGNORECASE,
+    r"^\s*(?:/deldrafts|delete\s+all\s+drafts|hamma\s+draftlarni\s+o'?chir|draftlarni\s+o'?chir|"
+    r"удалить\s+все\s+черновики|очистить\s+черновики|удали\s+черновики)\s*$",
+    re.IGNORECASE | re.UNICODE,
 )
 
 
