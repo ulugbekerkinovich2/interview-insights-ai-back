@@ -220,6 +220,9 @@ ALLOWED_ORIGINS = [
     "https://interview.misterdev.uz",
     "https://www.interview.misterdev.uz",
     "https://interview-api.misterdev.uz",
+    "https://ufqpai.uz",
+    "https://www.ufqpai.uz",
+    "https://api.ufqpai.uz",
 ]
 
 app.add_middleware(
