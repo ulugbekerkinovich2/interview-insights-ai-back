@@ -8,6 +8,9 @@ import logging
 import hashlib
 from typing import List, Optional
 
+from .rag_metrics import metrics, now_ms
+from .rate_limiter import TokenBucket
+
 logger = logging.getLogger(__name__)
 
 # Lazy imports — don't crash if not installed
@@ -21,6 +24,19 @@ QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION_NAME", "psychology")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 EMBED_MODEL = "mistral-embed"  # Mistral's embedding model
 EMBED_DIM = 1024  # mistral-embed output dimension
+
+# Configurable retrieval thresholds (cosine similarity, [-1, 1])
+_CONTEXT_SCORE_THRESHOLD = float(os.getenv("RAG_CONTEXT_SCORE_THRESHOLD", "0.3"))
+
+# Mistral embed API rate limit. Free tier allows ~1 rps; paid tier up to ~6 rps.
+_EMBED_RPS = float(os.getenv("MISTRAL_EMBED_RPS", "5"))
+_EMBED_BURST = int(os.getenv("MISTRAL_EMBED_BURST", "10"))
+_EMBED_WAIT_TIMEOUT = float(os.getenv("MISTRAL_EMBED_WAIT_TIMEOUT", "30"))
+_embed_bucket = TokenBucket(rate=_EMBED_RPS, burst=_EMBED_BURST, name="mistral_embed")
+
+
+def embed_bucket_stats() -> dict:
+    return _embed_bucket.stats()
 
 
 def _get_qdrant():
@@ -48,8 +64,15 @@ def _embed_text(text: str) -> Optional[List[float]]:
     # Cache by text hash
     key = hashlib.md5(text.encode()).hexdigest()
     if key in _embed_cache:
+        metrics.record_embed(elapsed_ms=0.0, cache_hit=True)
         return _embed_cache[key]
 
+    if not _embed_bucket.acquire(timeout=_EMBED_WAIT_TIMEOUT):
+        logger.warning("Mistral embed rate limit exceeded; skipping embedding")
+        metrics.record_embed(elapsed_ms=0.0, error=True)
+        return None
+
+    t0 = now_ms()
     try:
         import requests
         resp = requests.post(
@@ -66,9 +89,11 @@ def _embed_text(text: str) -> Optional[List[float]]:
             for k in keys[:len(keys) // 2]:
                 del _embed_cache[k]
         _embed_cache[key] = vector
+        metrics.record_embed(elapsed_ms=now_ms() - t0)
         return vector
     except Exception as e:
         logger.warning(f"Embedding failed: {e}")
+        metrics.record_embed(elapsed_ms=now_ms() - t0, error=True)
         return None
 
 
@@ -133,14 +158,17 @@ def search_context(query: str, top_k: int = 3) -> str:
     if not vector:
         return ""
 
+    t0 = now_ms()
     try:
         results = client.search(
             collection_name=QDRANT_COLLECTION,
             query_vector=vector,
             limit=top_k,
-            score_threshold=0.3,
+            score_threshold=_CONTEXT_SCORE_THRESHOLD,
         )
+        elapsed = now_ms() - t0
         if not results:
+            metrics.record_search(elapsed_ms=elapsed, hits=0)
             return ""
 
         texts = []
@@ -149,10 +177,19 @@ def search_context(query: str, top_k: int = 3) -> str:
             if text:
                 texts.append(text)
 
+        top = float(results[0].score) if results else 0.0
+        metrics.record_search(elapsed_ms=elapsed, hits=len(texts), top_score=top)
         context = "\n---\n".join(texts)
-        logger.info(f"RAG: found {len(texts)} relevant docs (scores: {[round(r.score, 2) for r in results]})")
+        logger.info(
+            "RAG ctx: %d docs in %.0fms (scores=%s, threshold=%.2f)",
+            len(texts),
+            elapsed,
+            [round(r.score, 2) for r in results],
+            _CONTEXT_SCORE_THRESHOLD,
+        )
         return context
     except Exception as e:
+        metrics.record_search(elapsed_ms=now_ms() - t0, hits=0, error=True)
         logger.warning(f"Qdrant search failed: {e}")
         return ""
 

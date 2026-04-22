@@ -80,6 +80,7 @@ class Candidate(Base):
     pin_hash = Column(String, nullable=True) # Hashed 6-digit PIN
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=True) # The Recruiter who created this
     answers = Column(JSON, default=list)
+    filters = Column(JSON, default=list)  # Per-candidate HR requirements (list of strings)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 class VisualRecord(Base):
@@ -133,6 +134,24 @@ class KnowledgeDocument(Base):
     approved_at = Column(DateTime, nullable=True)
     chunks_count = Column(Integer, default=0)
     qdrant_indexed = Column(Boolean, default=False)
+
+
+class RetrainJob(Base):
+    __tablename__ = "retrain_jobs"
+    id = Column(Integer, primary_key=True, index=True)
+    # pending | running | completed | failed
+    status = Column(String, default="pending", index=True)
+    triggered_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    started_at = Column(DateTime, default=datetime.datetime.utcnow)
+    finished_at = Column(DateTime, nullable=True)
+    total_docs = Column(Integer, default=0)
+    processed = Column(Integer, default=0)
+    succeeded = Column(Integer, default=0)
+    failed = Column(Integer, default=0)
+    chunks_total = Column(Integer, default=0)
+    current_doc_id = Column(Integer, nullable=True)
+    failed_ids = Column(JSON, default=list)
+    error = Column(Text, nullable=True)
 
 
 def init_db():

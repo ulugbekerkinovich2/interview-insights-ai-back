@@ -19,7 +19,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
@@ -333,7 +333,7 @@ def reindex_knowledge(
 
 
 def _retrain_all(db: Session) -> schemas.KnowledgeRetrainReport:
-    """Re-chunk + re-embed + re-upsert every approved document."""
+    """Re-chunk + re-embed + re-upsert every approved document (synchronous)."""
     docs = (
         db.query(database.KnowledgeDocument)
         .filter(database.KnowledgeDocument.approved.is_(True))
@@ -360,25 +360,168 @@ def _retrain_all(db: Session) -> schemas.KnowledgeRetrainReport:
     )
 
 
-@router.post("/reindex-all", response_model=schemas.KnowledgeRetrainReport)
+def _job_to_schema(job: database.RetrainJob) -> schemas.RetrainJobSchema:
+    total = int(job.total_docs or 0)
+    processed = int(job.processed or 0)
+    pct = round((processed / total) * 100, 1) if total > 0 else 0.0
+    data = schemas.RetrainJobSchema.model_validate(job)
+    data.progress_pct = pct
+    data.failed_ids = list(job.failed_ids or [])
+    return data
+
+
+def _run_retrain_job(job_id: int, admin_id: int) -> None:
+    """Background worker — re-embeds every approved document, updating the job row."""
+    from database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        job = db.query(database.RetrainJob).get(job_id)
+        if not job:
+            return
+        docs = (
+            db.query(database.KnowledgeDocument)
+            .filter(database.KnowledgeDocument.approved.is_(True))
+            .order_by(database.KnowledgeDocument.id.asc())
+            .all()
+        )
+        job.status = "running"
+        job.total_docs = len(docs)
+        job.processed = 0
+        job.succeeded = 0
+        job.failed = 0
+        job.chunks_total = 0
+        job.failed_ids = []
+        db.commit()
+
+        failed_ids: List[int] = []
+        try:
+            for doc in docs:
+                job.current_doc_id = doc.id
+                db.commit()
+                try:
+                    _reindex(doc, db=db)
+                except Exception as exc:
+                    logger.warning("retrain: reindex failed for doc_id=%s: %s", doc.id, exc)
+                    doc.qdrant_indexed = False
+
+                if doc.qdrant_indexed:
+                    job.succeeded = int(job.succeeded or 0) + 1
+                    job.chunks_total = int(job.chunks_total or 0) + int(doc.chunks_count or 0)
+                else:
+                    failed_ids.append(doc.id)
+                    job.failed = len(failed_ids)
+                    job.failed_ids = list(failed_ids)
+                job.processed = int(job.processed or 0) + 1
+                db.commit()
+
+            job.status = "completed"
+            job.current_doc_id = None
+            job.finished_at = datetime.datetime.utcnow()
+            db.commit()
+        except Exception as exc:
+            logger.exception("retrain job %s crashed", job_id)
+            job.status = "failed"
+            job.error = str(exc)[:2000]
+            job.finished_at = datetime.datetime.utcnow()
+            db.commit()
+
+        try:
+            notif_svc.notify_user(
+                db,
+                admin_id,
+                title="Переобучение завершено" if job.status == "completed" else "Переобучение прервано",
+                message=(
+                    f"Попыток: {job.total_docs} • Успешно: {job.succeeded} "
+                    f"• Ошибок: {job.failed} • Всего фрагментов: {job.chunks_total}"
+                ),
+                type="success" if (job.status == "completed" and job.failed == 0) else "warning",
+                meta={
+                    "event": "knowledge.retrained",
+                    "job_id": job.id,
+                    "status": job.status,
+                    "attempted": job.total_docs,
+                    "succeeded": job.succeeded,
+                    "failed": job.failed,
+                    "chunks_total": job.chunks_total,
+                    "failed_ids": list(job.failed_ids or []),
+                },
+            )
+        except Exception:
+            logger.exception("retrain job %s: notification failed", job_id)
+    finally:
+        db.close()
+
+
+def _active_retrain_job(db: Session) -> Optional[database.RetrainJob]:
+    return (
+        db.query(database.RetrainJob)
+        .filter(database.RetrainJob.status.in_(("pending", "running")))
+        .order_by(database.RetrainJob.id.desc())
+        .first()
+    )
+
+
+@router.post("/reindex-all", response_model=schemas.RetrainJobSchema, status_code=202)
 def reindex_all(
+    background_tasks: BackgroundTasks,
     db: Session = Depends(_get_db),
     admin: database.User = Depends(_require_super_admin),
 ):
-    """Retrain the whole knowledge base — re-embeds every approved document."""
-    report = _retrain_all(db)
-    notif_svc.notify_user(
-        db,
-        admin.id,
-        title="Переобучение завершено",
-        message=(
-            f"Попыток: {report.attempted} • Успешно: {report.succeeded} "
-            f"• Ошибок: {report.failed} • Всего фрагментов: {report.chunks_total}"
-        ),
-        type="success" if report.failed == 0 else "warning",
-        meta={"event": "knowledge.retrained", **report.model_dump()},
+    """Queue a full re-embedding job. Returns the job row immediately — poll
+    ``GET /knowledge/retrain/{id}`` or ``/retrain/latest`` for progress.
+    """
+    active = _active_retrain_job(db)
+    if active:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Переобучение уже выполняется (job #{active.id}, status={active.status})",
+        )
+
+    job = database.RetrainJob(
+        status="pending",
+        triggered_by=admin.id,
+        started_at=datetime.datetime.utcnow(),
+        failed_ids=[],
     )
-    return report
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    background_tasks.add_task(_run_retrain_job, job.id, admin.id)
+    return _job_to_schema(job)
+
+
+@router.get("/retrain/latest", response_model=Optional[schemas.RetrainJobSchema])
+def retrain_latest(
+    db: Session = Depends(_get_db),
+    _admin: database.User = Depends(_require_super_admin),
+):
+    job = db.query(database.RetrainJob).order_by(database.RetrainJob.id.desc()).first()
+    return _job_to_schema(job) if job else None
+
+
+@router.get("/retrain/{job_id}", response_model=schemas.RetrainJobSchema)
+def retrain_status(
+    job_id: int,
+    db: Session = Depends(_get_db),
+    _admin: database.User = Depends(_require_super_admin),
+):
+    job = db.query(database.RetrainJob).get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job не найден")
+    return _job_to_schema(job)
+
+
+@router.get("/metrics")
+def knowledge_metrics(
+    _admin: database.User = Depends(_require_super_admin),
+):
+    """RAG retrieval + embedding metrics (in-memory, process-local)."""
+    from utils.rag_metrics import metrics as rag_metrics
+    from utils.rag_service import embed_bucket_stats
+
+    return {"metrics": rag_metrics.snapshot(), "rate_limit": embed_bucket_stats()}
 
 
 @router.put("/{doc_id}", response_model=schemas.KnowledgeDocSchema)
@@ -714,29 +857,39 @@ def _chat_edit(
     )
 
 
-def _chat_retrain(db: Session, admin: database.User) -> schemas.KnowledgeChatResponse:
-    report = _retrain_all(db)
-    notif_svc.notify_user(
-        db,
-        admin.id,
-        title="Переобучение завершено",
-        message=(
-            f"Попыток: {report.attempted} • Успешно: {report.succeeded} "
-            f"• Ошибок: {report.failed} • Всего фрагментов: {report.chunks_total}"
-        ),
-        type="success" if report.failed == 0 else "warning",
-        meta={"event": "knowledge.retrained", **report.model_dump()},
+def _chat_retrain(
+    db: Session, admin: database.User, background_tasks: BackgroundTasks
+) -> schemas.KnowledgeChatResponse:
+    active = _active_retrain_job(db)
+    if active:
+        return schemas.KnowledgeChatResponse(
+            answer=(
+                f"⏳ Переобучение уже выполняется (job #{active.id}, "
+                f"{active.processed}/{active.total_docs}). "
+                f"Повторный запуск невозможен."
+            ),
+            role_seen=admin.role or "",
+            action="retrain",
+            data=_job_to_schema(active).model_dump(),
+        )
+
+    job = database.RetrainJob(
+        status="pending",
+        triggered_by=admin.id,
+        started_at=datetime.datetime.utcnow(),
+        failed_ids=[],
     )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    background_tasks.add_task(_run_retrain_job, job.id, admin.id)
+
     text = (
-        f"🚂 Переобучение завершено.\n"
-        f"Попыток: {report.attempted}\n"
-        f"Успешно: {report.succeeded}\n"
-        f"Ошибок: {report.failed}"
-        f"{' (' + ', '.join('#' + str(i) for i in report.failed_ids) + ')' if report.failed_ids else ''}\n"
-        f"Всего фрагментов: {report.chunks_total}"
+        f"🚂 Переобучение запущено (job #{job.id}). "
+        f"Отслеживайте прогресс: GET /knowledge/retrain/{job.id}"
     )
     return schemas.KnowledgeChatResponse(
-        answer=text, role_seen=admin.role or "", action="retrain", data=report.model_dump()
+        answer=text, role_seen=admin.role or "", action="retrain", data=_job_to_schema(job).model_dump()
     )
 
 
@@ -882,6 +1035,7 @@ def _chat_status(admin: database.User) -> schemas.KnowledgeChatResponse:
 @router.post("/chat", response_model=schemas.KnowledgeChatResponse)
 def chat_knowledge(
     payload: schemas.KnowledgeChatRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(_get_db),
     user: database.User = Depends(_require_authenticated),
 ):
@@ -915,7 +1069,7 @@ def chat_knowledge(
         if intent.action == "edit" and intent.doc_id is not None:
             return _chat_edit(db, user, intent.doc_id, intent.title, intent.content)
         if intent.action == "retrain":
-            return _chat_retrain(db, user)
+            return _chat_retrain(db, user, background_tasks)
         if intent.action == "stats":
             return _chat_stats(db, user)
         if intent.action == "search" and intent.query:

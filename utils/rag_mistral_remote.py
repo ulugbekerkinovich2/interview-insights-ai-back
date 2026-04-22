@@ -6,7 +6,7 @@ import requests
 from dotenv import load_dotenv
 from project_paths import resolve_project_dir
 
-PROJECT_DIR = resolve_project_dir(__file__)
+PROJECT_DIR = resolve_project_dir(__file__, levels_up=1)
 PROJECT_ROOT = os.path.dirname(PROJECT_DIR)
 
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
@@ -20,8 +20,17 @@ MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 # Fallback: Ollama local
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
 
 DEFAULT_TRANSCRIPT_FILE = os.path.join(PROJECT_DIR, "whisper_output.txt")
+
+
+def ollama_headers():
+    headers = {"Content-Type": "application/json"}
+    if OLLAMA_API_KEY:
+        headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+        headers["X-API-Key"] = OLLAMA_API_KEY
+    return headers
 
 
 def read_transcript_text(transcript_path):
@@ -83,7 +92,7 @@ def ask_ollama(prompt):
     """Fallback: Call local Ollama server"""
     url = f"{OLLAMA_BASE_URL}/api/generate"
     data = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
-    response = requests.post(url, json=data, timeout=120)
+    response = requests.post(url, json=data, headers=ollama_headers(), timeout=120)
     response.raise_for_status()
     return response.json().get("response", "").strip()
 

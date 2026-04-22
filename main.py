@@ -727,7 +727,9 @@ def update_candidate(candidate_id: int, candidate: schemas.CandidateCreate, db: 
     db_candidate.summary = candidate.summary
     db_candidate.status = candidate.status
     db_candidate.answers = candidate.answers
+    db_candidate.filters = candidate.filters
     flag_modified(db_candidate, "answers")
+    flag_modified(db_candidate, "filters")
 
     db.commit()
     db.refresh(db_candidate)
@@ -1142,6 +1144,18 @@ def process_turn_api(
             face_context = ""
             if parsed_face_stats:
                 face_context = f"\nДАННЫЕ ВИДЕОАНАЛИЗА ЛИЦА: Взгляд сфокусирован {parsed_face_stats.get('gaze_focused_pct', 0)}%, отведён {parsed_face_stats.get('gaze_away_pct', 0)}%, глаза закрыты {parsed_face_stats.get('eyes_closed_pct', 0)}%."
+
+            # Merge global + per-candidate HR filters into the analysis context.
+            try:
+                global_setting = analysis_db.query(database.GlobalSetting).filter_by(key="global_filters").first()
+                global_filters = global_setting.value if global_setting and isinstance(global_setting.value, list) else []
+                cand_for_filters = analysis_db.query(database.Candidate).filter_by(id=candidate_id).first()
+                candidate_filters = list(cand_for_filters.filters or []) if cand_for_filters else []
+                merged = [*global_filters, *candidate_filters]
+                if merged:
+                    face_context += "\nТРЕБОВАНИЯ HR (оценивайте соответствие):\n- " + "\n- ".join(merged[:16])
+            except Exception as exc:
+                logger.warning(f"filter merge failed: {exc}")
 
             rag_ai = ""
             t0 = _time.time()

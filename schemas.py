@@ -14,6 +14,7 @@ class CandidateBase(BaseModel):
     status: Optional[str] = "interview_started"
     access_code: Optional[str] = None
     answers: List[dict] = Field(default_factory=list)
+    filters: List[str] = Field(default_factory=list)
 
 class CandidateCreate(CandidateBase):
     pass
@@ -149,6 +150,26 @@ class KnowledgeRetrainReport(BaseModel):
     failed_ids: List[int] = Field(default_factory=list)
 
 
+class RetrainJobSchema(BaseModel):
+    id: int
+    status: str  # pending | running | completed | failed
+    triggered_by: Optional[int] = None
+    started_at: Optional[Any] = None
+    finished_at: Optional[Any] = None
+    total_docs: int = 0
+    processed: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    chunks_total: int = 0
+    current_doc_id: Optional[int] = None
+    failed_ids: List[int] = Field(default_factory=list)
+    error: Optional[str] = None
+    progress_pct: float = 0.0
+
+    class Config:
+        from_attributes = True
+
+
 class KnowledgeChatRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=4000)
     top_k: Optional[int] = Field(default=5, ge=1, le=20)
@@ -172,7 +193,11 @@ class KnowledgeChatResponse(BaseModel):
     # Optional structured payload for admin/chat-driven actions (e.g. a
     # list of draft summaries, or the affected ``doc_id``).
     data: Optional[Any] = None
-    # Populated only for SuperAdmin (testing mode)
+    # Source fragments referenced by the answer (visible to every user).
+    # Each entry: {index, doc_id, title, [cited, score, backend, approved] — admin only}.
     sources: Optional[List[Dict[str, Any]]] = None
+    # 1-based indices of [N] markers that the LLM used in its answer.
+    cited_indices: Optional[List[int]] = None
+    # Populated only for SuperAdmin (testing mode)
     confidence: Optional[float] = None
     used_chunks: Optional[List[KnowledgeUsedChunk]] = None

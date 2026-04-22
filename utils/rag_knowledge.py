@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
+from .rag_metrics import metrics, now_ms
 from .rag_service import (
     EMBED_DIM,
     QDRANT_COLLECTION,
@@ -26,6 +27,9 @@ from .rag_service import (
     _get_qdrant,
     ensure_collection,
 )
+
+# Configurable retrieval threshold for chat (cosine similarity in [-1, 1]).
+_CHAT_SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "0.35"))
 
 logger = logging.getLogger(__name__)
 
@@ -228,17 +232,20 @@ def search_knowledge(
     only_approved: bool = True,
     category: Optional[str] = None,
     language: Optional[str] = None,
-    score_threshold: float = 0.35,
+    score_threshold: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Return list of {text, score, doc_id, title, chunk_index, approved, ...}."""
     client = _get_qdrant()
     if client is None:
         return []
 
+    threshold = _CHAT_SCORE_THRESHOLD if score_threshold is None else float(score_threshold)
+
     vector = _embed_text(query)
     if not vector:
         return []
 
+    t0 = now_ms()
     try:
         from qdrant_client.models import FieldCondition, Filter, MatchValue
 
@@ -256,11 +263,24 @@ def search_knowledge(
             query_vector=vector,
             limit=top_k,
             query_filter=qfilter,
-            score_threshold=score_threshold,
+            score_threshold=threshold,
         )
     except Exception as exc:
+        metrics.record_search(elapsed_ms=now_ms() - t0, hits=0, error=True)
         logger.warning("search_knowledge failed: %s", exc)
         return []
+
+    elapsed = now_ms() - t0
+    top = float(results[0].score) if results else 0.0
+    metrics.record_search(elapsed_ms=elapsed, hits=len(results or []), top_score=top)
+    logger.info(
+        "RAG chat: %d hits in %.0fms (scores=%s, threshold=%.2f, approved_only=%s)",
+        len(results or []),
+        elapsed,
+        [round(r.score, 3) for r in (results or [])],
+        threshold,
+        only_approved,
+    )
 
     out: List[Dict[str, Any]] = []
     for r in results or []:
@@ -291,6 +311,11 @@ SYSTEM_PROMPT_UZ = """Ты — эмпатичный психологически
 - Опирайся только на КОНТЕКСТ, указанный ниже. Если в контексте нет нужной информации, ответь ровно этой фразой: "Недостаточно данных для ответа на этот вопрос".
 - Не домысливай и не придумывай факты.
 
+ЦИТИРОВАНИЕ:
+- Каждое фактическое утверждение должно сопровождаться маркером источника в квадратных скобках — например [1], [2]. Нумерация соответствует фрагментам КОНТЕКСТА.
+- Если одно утверждение опирается на несколько фрагментов — перечисли их: [1][3].
+- Не выдумывай номера — используй только те, что присутствуют в КОНТЕКСТЕ.
+
 СТИЛЬ:
 - Простой, человечный, тёплый язык. Избегай тяжёлого научного жаргона.
 - Отвечай кратко и по существу.
@@ -299,6 +324,23 @@ SYSTEM_PROMPT_UZ = """Ты — эмпатичный психологически
   2) Возможные причины.
   3) Практические советы / шаги.
 """
+
+_CITATION_RE = re.compile(r"\[(\d+)\]")
+
+
+def extract_cited_indices(answer: str, max_index: int) -> List[int]:
+    """Return unique cited 1-based chunk indices that actually appear in the answer."""
+    if not answer or max_index <= 0:
+        return []
+    seen: List[int] = []
+    for m in _CITATION_RE.finditer(answer):
+        try:
+            idx = int(m.group(1))
+        except ValueError:
+            continue
+        if 1 <= idx <= max_index and idx not in seen:
+            seen.append(idx)
+    return seen
 
 
 def _build_user_prompt(query: str, chunks: List[Dict[str, Any]]) -> str:
@@ -438,9 +480,33 @@ def run_chat(
     if not answer:
         answer = FALLBACK_NO_CONTEXT
 
+    cited_indices = extract_cited_indices(answer, max_index=len(chunks))
+
+    # Build source list visible to everyone (cited fragments only, minimal fields).
+    # Non-admin users see title + number; admins see the full chunk payload below.
+    if cited_indices:
+        public_sources = [
+            {
+                "index": idx,
+                "doc_id": chunks[idx - 1].get("doc_id"),
+                "title": chunks[idx - 1].get("title"),
+            }
+            for idx in cited_indices
+        ]
+    elif chunks and answer != FALLBACK_NO_CONTEXT:
+        # Model didn't cite — expose the top-ranked chunk titles so users can verify.
+        public_sources = [
+            {"index": i + 1, "doc_id": c.get("doc_id"), "title": c.get("title")}
+            for i, c in enumerate(chunks[:3])
+        ]
+    else:
+        public_sources = []
+
     response: Dict[str, Any] = {
         "answer": answer,
         "role_seen": role or "anonymous",
+        "sources": public_sources,
+        "cited_indices": cited_indices,
     }
 
     if admin:
@@ -458,13 +524,15 @@ def run_chat(
         ]
         response["sources"] = [
             {
+                "index": i + 1,
                 "doc_id": c.get("doc_id"),
                 "title": c.get("title"),
                 "score": c.get("score"),
                 "approved": c.get("approved"),
                 "backend": used_backend,
+                "cited": (i + 1) in cited_indices,
             }
-            for c in chunks
+            for i, c in enumerate(chunks)
         ]
 
     return response

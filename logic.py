@@ -135,32 +135,124 @@ MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
+AI_PROVIDER = (os.getenv("AI_PROVIDER", "auto") or "auto").strip().lower()
+
+
+def _ollama_headers(include_content_type: bool = True) -> dict:
+    headers = {"Content-Type": "application/json"} if include_content_type else {}
+    if OLLAMA_API_KEY:
+        # Support common protected Ollama gateways/proxies without exposing the raw key anywhere else.
+        headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+        headers["X-API-Key"] = OLLAMA_API_KEY
+    return headers
 
 
 def _call_mistral_cloud(prompt: str) -> str:
     """Direct Mistral Cloud API call — no subprocess overhead."""
+    if not MISTRAL_API_KEY:
+        raise AIServiceError("MISTRAL_API_KEY not set")
+
     headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
     data = {"model": MISTRAL_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 2048}
-    resp = http_requests.post(MISTRAL_API_URL, json=data, headers=headers, timeout=300)
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"].strip()
+    try:
+        resp = http_requests.post(MISTRAL_API_URL, json=data, headers=headers, timeout=300)
+        resp.raise_for_status()
+        text = resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        raise AIServiceError(f"Mistral request failed: {exc}") from exc
+
+    if not text:
+        raise AIServiceError("Mistral returned empty response")
+
+    return text
 
 
 def _call_ollama(prompt: str) -> str:
-    """Fallback: local Ollama server."""
-    resp = http_requests.post(f"{OLLAMA_BASE_URL}/api/generate", json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}, timeout=120)
-    resp.raise_for_status()
-    return resp.json().get("response", "").strip()
+    """Primary local LLM call via Ollama server."""
+    try:
+        resp = http_requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+            headers=_ollama_headers(),
+            timeout=120,
+        )
+        resp.raise_for_status()
+        text = resp.json().get("response", "").strip()
+    except Exception as exc:
+        raise AIServiceError(f"Ollama request failed: {exc}") from exc
+
+    if not text:
+        raise AIServiceError("Ollama returned empty response")
+
+    return text
 
 
 def _call_ai(prompt: str) -> str:
-    """Try Mistral Cloud first, fallback to Ollama."""
-    if MISTRAL_API_KEY:
+    """Route LLM calls using env-based provider policy."""
+    if AI_PROVIDER == "ollama":
+        return _call_ollama(prompt)
+
+    if AI_PROVIDER == "mistral":
+        return _call_mistral_cloud(prompt)
+
+    if AI_PROVIDER in {"auto", "mistral_then_ollama"}:
+        if MISTRAL_API_KEY:
+            try:
+                return _call_mistral_cloud(prompt)
+            except AIServiceError as exc:
+                logger.warning(f"Mistral Cloud error, falling back to Ollama: {exc}")
+        return _call_ollama(prompt)
+
+    if AI_PROVIDER == "ollama_then_mistral":
         try:
-            return _call_mistral_cloud(prompt)
-        except Exception as e:
-            logger.warning(f"Mistral Cloud error, falling back to Ollama: {e}")
-    return _call_ollama(prompt)
+            return _call_ollama(prompt)
+        except AIServiceError as exc:
+            logger.warning(f"Ollama error, falling back to Mistral: {exc}")
+            if MISTRAL_API_KEY:
+                return _call_mistral_cloud(prompt)
+            raise
+
+    raise AIServiceError(f"Unsupported AI_PROVIDER value: {AI_PROVIDER}")
+
+
+def get_ai_runtime_status() -> dict:
+    """Expose current AI runtime configuration for settings/health UI."""
+    ollama_status = {
+        "configured": bool(OLLAMA_BASE_URL),
+        "base_url": OLLAMA_BASE_URL,
+        "model": OLLAMA_MODEL,
+        "api_key_configured": bool(OLLAMA_API_KEY),
+        "reachable": False,
+        "models": [],
+        "detail": None,
+    }
+
+    try:
+        resp = http_requests.get(
+            f"{OLLAMA_BASE_URL}/api/tags",
+            headers=_ollama_headers(include_content_type=False),
+            timeout=5,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        ollama_status["reachable"] = True
+        ollama_status["models"] = [
+            item.get("name")
+            for item in data.get("models", [])
+            if isinstance(item, dict) and item.get("name")
+        ]
+    except Exception as exc:
+        ollama_status["detail"] = str(exc)
+
+    return {
+        "provider": AI_PROVIDER,
+        "mistral": {
+            "configured": bool(MISTRAL_API_KEY),
+            "model": MISTRAL_MODEL,
+        },
+        "ollama": ollama_status,
+    }
 
 
 def _build_analysis_prompt(question: str, answer: str, context: str = "") -> str:
