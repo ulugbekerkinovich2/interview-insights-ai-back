@@ -44,11 +44,12 @@ def _get_qdrant():
     global _qdrant_client
     if _qdrant_client is not None:
         return _qdrant_client
-    if not QDRANT_URL or not QDRANT_API_KEY or QDRANT_API_KEY == "your_qdrant_key_here":
+    if not QDRANT_URL:
         return None
+    api_key = QDRANT_API_KEY if QDRANT_API_KEY and QDRANT_API_KEY != "your_qdrant_key_here" else None
     try:
         from qdrant_client import QdrantClient
-        _qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=10)
+        _qdrant_client = QdrantClient(url=QDRANT_URL, api_key=api_key, timeout=10)
         logger.info(f"Qdrant connected: {QDRANT_URL}")
         return _qdrant_client
     except Exception as e:
