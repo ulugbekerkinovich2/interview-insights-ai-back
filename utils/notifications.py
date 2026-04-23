@@ -8,6 +8,7 @@ startup and schedule pushes onto it using ``run_coroutine_threadsafe``.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import threading
 from collections import defaultdict
@@ -87,6 +88,9 @@ hub = NotificationHub()
 # --- Persistence + push helpers ----------------------------------------------
 
 def _serialize(notif: database.Notification) -> Dict[str, Any]:
+    created_at = notif.created_at
+    if created_at is not None and created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=datetime.timezone.utc)
     return {
         "id": notif.id,
         "title": notif.title,
@@ -94,7 +98,7 @@ def _serialize(notif: database.Notification) -> Dict[str, Any]:
         "type": notif.type,
         "is_read": bool(notif.is_read),
         "user_id": notif.user_id,
-        "created_at": notif.created_at.isoformat() if notif.created_at else None,
+        "created_at": created_at.isoformat() if created_at else None,
     }
 
 
