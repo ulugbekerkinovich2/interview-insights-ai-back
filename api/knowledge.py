@@ -252,6 +252,25 @@ def list_knowledge(
     return [_serialize(doc) for doc in q.all()]
 
 
+@router.get("/stats", response_model=schemas.KnowledgeStats)
+def knowledge_stats(
+    db: Session = Depends(_get_db),
+    _admin: database.User = Depends(_require_super_admin),
+):
+    return _collect_stats(db)
+
+
+@router.get("/metrics")
+def knowledge_metrics(
+    _admin: database.User = Depends(_require_super_admin),
+):
+    """RAG retrieval + embedding metrics (in-memory, process-local)."""
+    from utils.rag_metrics import metrics as rag_metrics
+    from utils.rag_service import embed_bucket_stats
+
+    return {"metrics": rag_metrics.snapshot(), "rate_limit": embed_bucket_stats()}
+
+
 @router.get("/{doc_id}", response_model=schemas.KnowledgeDocSchema)
 def get_knowledge(
     doc_id: int,
@@ -513,17 +532,6 @@ def retrain_status(
     return _job_to_schema(job)
 
 
-@router.get("/metrics")
-def knowledge_metrics(
-    _admin: database.User = Depends(_require_super_admin),
-):
-    """RAG retrieval + embedding metrics (in-memory, process-local)."""
-    from utils.rag_metrics import metrics as rag_metrics
-    from utils.rag_service import embed_bucket_stats
-
-    return {"metrics": rag_metrics.snapshot(), "rate_limit": embed_bucket_stats()}
-
-
 @router.put("/{doc_id}", response_model=schemas.KnowledgeDocSchema)
 def update_knowledge(
     doc_id: int,
@@ -642,14 +650,6 @@ def _collect_stats(db: Session) -> schemas.KnowledgeStats:
         by_language={(k or "?"): v for k, v in by_language.items()},
         qdrant=get_collection_info(),
     )
-
-
-@router.get("/stats", response_model=schemas.KnowledgeStats)
-def knowledge_stats(
-    db: Session = Depends(_get_db),
-    _admin: database.User = Depends(_require_super_admin),
-):
-    return _collect_stats(db)
 
 
 @router.delete("/{doc_id}", status_code=204)
