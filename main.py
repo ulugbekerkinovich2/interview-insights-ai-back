@@ -1134,6 +1134,19 @@ def process_turn_api(
                 transcript = "(Речь не распознана)"
             stt_wall_ms = int((_time.time() - t0) * 1000)
 
+            # Step 1b: Smooth transcript via LLM (Mistral → Ollama).
+            # Preserve the raw STT output for audit and fall back to it on
+            # any smoothing failure.
+            transcript_raw = transcript
+            smooth_ms = 0
+            t0 = _time.time()
+            try:
+                transcript = logic.smooth_transcript(transcript_raw) or transcript_raw
+            except Exception as e:
+                logger.warning(f"Transcript smoothing failed: {e}")
+                transcript = transcript_raw
+            smooth_ms = int((_time.time() - t0) * 1000)
+
             # Step 2: Voice prosody (librosa)
             voice_raw = ""
             t0 = _time.time()
@@ -1202,13 +1215,15 @@ def process_turn_api(
                 for i, item in enumerate(ans):
                     if item.get("turn_uid") == turn_uid:
                         ans[i]["answer"] = transcript
+                        ans[i]["candidate_raw"] = transcript_raw
                         ans[i]["ai"] = rag_ai
                         ans[i]["voice_raw"] = voice_raw
                         ans[i]["stt_ms"] = stt_ms
                         ans[i]["stt_wall_ms"] = stt_wall_ms
+                        ans[i]["smooth_ms"] = smooth_ms
                         ans[i]["prosody_ms"] = prosody_ms
                         ans[i]["ai_ms"] = ai_ms
-                        ans[i]["total_ms"] = stt_wall_ms + prosody_ms + ai_ms
+                        ans[i]["total_ms"] = stt_wall_ms + smooth_ms + prosody_ms + ai_ms
                         # Cost tracking
                         audio_duration_sec = 0
                         try:

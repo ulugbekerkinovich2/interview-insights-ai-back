@@ -255,6 +255,58 @@ def get_ai_runtime_status() -> dict:
     }
 
 
+def smooth_transcript(raw: str) -> str:
+    """Clean up an STT transcript (Deepgram/Whisper) via the LLM.
+
+    Fixes obvious mishearings, restores punctuation, trims repeated filler.
+    Preserves meaning, language mix, and wording — never summarizes or
+    invents content. Falls back to the raw text on any LLM failure so the
+    caller is always guaranteed a non-empty string.
+    """
+    text = (raw or "").strip()
+    if len(text) < 3:
+        return text
+
+    prompt = (
+        "Ты — редактор стенограмм устной речи на русском/узбекском. "
+        "Перед тобой сырой текст от системы распознавания речи "
+        "(Deepgram или Whisper). В нём могут быть пропущенные знаки "
+        "препинания, ослышки в отдельных словах, обрывы и повторы.\n\n"
+        "ЗАДАЧА: исправь только явные ошибки распознавания и расставь "
+        "знаки препинания. Сохрани смысл, стиль и язык оригинала "
+        "(не переводи). НЕ перефразируй, НЕ сокращай, НЕ добавляй "
+        "новой информации. Если фраза и так звучит естественно — "
+        "оставь как есть.\n\n"
+        f"СЫРОЙ ТЕКСТ:\n{text}\n\n"
+        "ОЧИЩЕННЫЙ ТЕКСТ (верни только текст, без комментариев "
+        "и без префиксов):"
+    )
+
+    try:
+        cleaned = _call_ai(prompt).strip()
+    except AIServiceError as exc:
+        logger.warning(f"smooth_transcript LLM failed: {exc}")
+        return text
+    except Exception as exc:
+        logger.warning(f"smooth_transcript unexpected error: {exc}")
+        return text
+
+    if not cleaned:
+        return text
+
+    # Guard against hallucinated expansion or truncation: if the model
+    # rewrote length by more than 2x or shrunk it by more than half, it
+    # likely changed the content — trust the raw instead.
+    ratio = len(cleaned) / max(1, len(text))
+    if ratio > 2.0 or ratio < 0.5:
+        logger.warning(
+            f"smooth_transcript rejected result (ratio={ratio:.2f}) — keeping raw"
+        )
+        return text
+
+    return cleaned
+
+
 def _build_analysis_prompt(question: str, answer: str, context: str = "") -> str:
     question_block = f"\nВопрос HR:\n{question}\n" if question else ""
     context_block = f"\nТРЕБОВАНИЯ КОМПАНИИ:\n{context}\n" if context else ""
