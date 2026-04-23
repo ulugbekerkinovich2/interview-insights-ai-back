@@ -1143,10 +1143,37 @@ def process_turn_api(
                 logger.warning(f"Voice profiler failed: {e}")
             prosody_ms = int((_time.time() - t0) * 1000)
 
-            # Step 3: AI analysis (Mistral + RAG + face stats)
+            # Step 3: AI analysis (Mistral + RAG + face stats + emotion/stress aggregates)
             face_context = ""
             if parsed_face_stats:
                 face_context = f"\nДАННЫЕ ВИДЕОАНАЛИЗА ЛИЦА: Взгляд сфокусирован {parsed_face_stats.get('gaze_focused_pct', 0)}%, отведён {parsed_face_stats.get('gaze_away_pct', 0)}%, глаза закрыты {parsed_face_stats.get('eyes_closed_pct', 0)}%."
+
+            # Pull VisualRecord samples from the window the candidate was answering
+            # and summarize dominant emotion / stress for the AI prompt.
+            try:
+                from collections import Counter
+                window_sec = 120  # covers typical answer durations with margin
+                since = datetime.datetime.utcnow() - datetime.timedelta(seconds=window_sec)
+                recent_visuals = (
+                    analysis_db.query(database.VisualRecord)
+                    .filter(
+                        database.VisualRecord.candidate_id == candidate_id,
+                        database.VisualRecord.timestamp >= since,
+                    )
+                    .all()
+                )
+                if recent_visuals:
+                    emotions = [v.emotion for v in recent_visuals if v.emotion]
+                    stresses = [v.stress_level for v in recent_visuals if v.stress_level]
+                    dominant_emotion = Counter(emotions).most_common(1)[0][0] if emotions else "—"
+                    dominant_stress = Counter(stresses).most_common(1)[0][0] if stresses else "—"
+                    face_context += (
+                        f"\nПОВЕДЕНИЕ И ЭМОЦИИ (по {len(recent_visuals)} видеокадрам за этот ответ): "
+                        f"доминирующая эмоция — {dominant_emotion}, уровень стресса — {dominant_stress}. "
+                        f"Учитывайте эти сигналы при оценке уверенности, искренности и эмоционального состояния кандидата."
+                    )
+            except Exception as exc:
+                logger.warning(f"visual aggregate failed: {exc}")
 
             # Merge global + per-candidate HR filters into the analysis context.
             try:
@@ -1236,6 +1263,18 @@ def validate_password_strength(password: str):
         raise HTTPException(status_code=400, detail="Пароль должен содержать хотя бы одну цифру")
     return True
 
+def _prune_old_frames(frames_dir: Path, max_age_sec: int) -> None:
+    """Best-effort cleanup — delete JPEGs older than max_age_sec."""
+    import time as _time
+    cutoff = _time.time() - max_age_sec
+    for p in frames_dir.glob("*.jpg"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+        except Exception:
+            continue
+
+
 @app.post("/logic/analyze-frame/")
 def analyze_frame_api(candidate_id: int, file: UploadFile = File(...)):
     from utils.face_analyzer import analyze_frame
@@ -1243,18 +1282,31 @@ def analyze_frame_api(candidate_id: int, file: UploadFile = File(...)):
     image_bytes = file.file.read()
     result = analyze_frame(image_bytes)
 
-    # Save visual record to DB if face detected
+    # Persist frame + visual record so admins can see the live feed and so
+    # the answer analyzer can pull emotion/stress signals from this window.
     if result.get("face_detected"):
         try:
+            frames_dir = MEDIA_DIR / "frames"
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"{secrets.token_hex(12)}.jpg"
+            file_path = frames_dir / filename
+            file_path.write_bytes(image_bytes)
+            image_url = f"/media/frames/{filename}"
+
             with SessionLocal() as frame_db:
                 record = database.VisualRecord(
                     candidate_id=candidate_id,
                     emotion=result.get("primary_emotion"),
                     stress_level=result.get("stress_level"),
+                    image_url=image_url,
                     notes=f"Взгляд: {result.get('gaze_direction', '—')}",
                 )
                 frame_db.add(record)
                 frame_db.commit()
+
+            # Probabilistic prune — ~1% of writes clean up frames older than 2h.
+            if secrets.randbelow(100) == 0:
+                _prune_old_frames(frames_dir, max_age_sec=2 * 3600)
         except Exception as e:
             logger.warning(f"Visual record save failed: {e}")
 
