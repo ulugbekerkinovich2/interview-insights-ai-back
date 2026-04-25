@@ -25,12 +25,21 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BACKEND_DIR.parent
+
+# MUHIM: Celery worker'lar sub-process sifatida ishga tushganda BACKEND_DIR
+# sys.path'da bo'lmasligi mumkin (PM2/cwd-bog'liq xulq). Buni o'zimiz
+# ta'minlaymiz — `import logic`, `import database` har qanday spawn yo'lida
+# ishlaydi (wrapper script, PYTHONPATH env, yoki to'g'ridan-to'g'ri celery
+# CLI orqali ishga tushganida ham).
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
 
 load_dotenv(PROJECT_ROOT / ".env")
 load_dotenv(BACKEND_DIR / ".env")
