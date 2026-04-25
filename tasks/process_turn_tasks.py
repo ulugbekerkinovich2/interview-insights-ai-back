@@ -34,18 +34,7 @@ def _safe_prosody(audio_path: str) -> str:
     return result
 
 
-@celery_app.task(
-    bind=True,
-    name="tasks.process_turn_tasks.process_turn_full_task",
-    autoretry_for=(Exception,),
-    retry_backoff=True,
-    retry_backoff_max=120,
-    retry_jitter=True,
-    max_retries=int(os.getenv("CELERY_MAX_RETRIES", "2")),
-    acks_late=True,
-)
-def process_turn_full_task(
-    self,
+def process_turn_pipeline(
     candidate_id: int,
     turn_uid: str,
     question: str,
@@ -53,10 +42,13 @@ def process_turn_full_task(
     audio_url: str,
     parsed_face_stats: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """STT + prosody + RAG pipeline ni bajaradi.
+    """STT + prosody + RAG pipeline ni bajaradi (Celery'siz, plain function).
+
+    Bu funksiyani threading fallback (main.py) ham, Celery task wrapper ham
+    chaqiradi. Celery'ga bog'liqlik YO'Q — Celery o'rnatilmagan bo'lsa ham
+    ishlaydi.
 
     Natija ``Candidate.answers`` dagi turn_uid ga teng element ichiga yoziladi.
-    Xato bo'lganda autoretry ishga tushadi (max_retries gacha).
     """
     import logic
     from database import SessionLocal, Candidate, VisualRecord, GlobalSetting
@@ -357,3 +349,36 @@ def _broadcast_turn(message: Dict[str, Any]) -> None:
             loop.close()
     except Exception as exc:
         raise exc
+
+
+# Celery task wrapper — Celery o'rnatilgan bo'lsa, decorator celery_app.task
+# (yo'q bo'lsa stub orqali plain functionga aylanadi). Wrapper plain pipeline
+# funksiyasiga o'tkazadi.
+@celery_app.task(
+    bind=True,
+    name="tasks.process_turn_tasks.process_turn_full_task",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=120,
+    retry_jitter=True,
+    max_retries=int(os.getenv("CELERY_MAX_RETRIES", "2")),
+    acks_late=True,
+)
+def process_turn_full_task(
+    self,
+    candidate_id: int,
+    turn_uid: str,
+    question: str,
+    audio_path: str,
+    audio_url: str,
+    parsed_face_stats: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Celery task wrapper — pipeline'ni chaqiradi, retry/log Celery boshqaradi."""
+    return process_turn_pipeline(
+        candidate_id=candidate_id,
+        turn_uid=turn_uid,
+        question=question,
+        audio_path=audio_path,
+        audio_url=audio_url,
+        parsed_face_stats=parsed_face_stats,
+    )

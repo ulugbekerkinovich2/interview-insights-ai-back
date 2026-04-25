@@ -1670,24 +1670,25 @@ def _submit_process_turn(candidate_id: int, turn_uid: str, question: str,
         except Exception as exc:
             logger.warning(f"Celery process-turn submit failed, fallback: {exc}")
 
-    # Fallback — threading orqali asl logika chaqiriladi
+    # Fallback — threading orqali plain pipeline funksiyasi chaqiriladi.
+    # MUHIM: bu yo'l Celery o'rnatilmagan bo'lsa ham ishlaydi (process_turn_pipeline
+    # — Celery'ga bog'liq emas).
     import threading as _threading
-    from tasks.process_turn_tasks import process_turn_full_task as _task
+    try:
+        from tasks.process_turn_tasks import process_turn_pipeline as _pipeline
+    except Exception as exc:
+        logger.error(f"process_turn_pipeline import failed: {exc}")
+        return None
 
     def _run():
         try:
-            # Celery task function ni to'g'ridan-to'g'ri chaqiramiz (bind=True chunki
-            # self parametri mock qilinadi — oddiy funksiya sifatida ishlashi uchun
-            # Celery app nomidan task.apply() ishlatamiz).
-            _task.apply(
-                kwargs={
-                    "candidate_id": candidate_id,
-                    "turn_uid": turn_uid,
-                    "question": question,
-                    "audio_path": audio_path,
-                    "audio_url": audio_url,
-                    "parsed_face_stats": parsed_face_stats,
-                }
+            _pipeline(
+                candidate_id=candidate_id,
+                turn_uid=turn_uid,
+                question=question,
+                audio_path=audio_path,
+                audio_url=audio_url,
+                parsed_face_stats=parsed_face_stats,
             )
         except Exception as e:
             logger.error(f"Fallback process-turn failed: {e}")
