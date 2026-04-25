@@ -63,9 +63,42 @@ def process_turn_full_task(
     from sqlalchemy.orm.attributes import flag_modified
 
     analysis_db = SessionLocal()
-    # Progressive WebSocket broadcaster — har bosqich tugagandan keyin
-    # frontend ko'rsatadi (kutib o'tirish kamayadi: 15-25s -> ~3s percenedt latency)
+
+    # Progressive update — har bosqich tugaganda DB'ga yozish + WS broadcast.
+    # DB yangilash MUHIM: WebSocket Celery cross-process'da yo'qoladi, lekin
+    # polling (frontend har 5 sek) DB'dan o'qiydi. Polling = ishonchli tarmoq,
+    # WebSocket = optional speedup.
+    def _save_turn_partial(updates: Dict[str, Any]) -> None:
+        """Candidate.answers ichidagi turn_uid ga teng element'ni atomic yangilaydi."""
+        try:
+            cand = (
+                analysis_db.query(Candidate)
+                .with_for_update()
+                .filter_by(id=candidate_id)
+                .first()
+            )
+            if not cand:
+                return
+            ans = list(cand.answers or [])
+            for i, item in enumerate(ans):
+                if item.get("turn_uid") == turn_uid:
+                    ans[i].update(updates)
+                    break
+            cand.answers = ans
+            flag_modified(cand, "answers")
+            analysis_db.commit()
+        except Exception as exc:
+            logger.warning(f"DB partial save failed (stage={updates.get('_stage')}): {exc}")
+            try:
+                analysis_db.rollback()
+            except Exception:
+                pass
+
     def _broadcast_partial(partial_update: Dict[str, Any]) -> None:
+        """Avval DB ga yozadi (polling uchun), so'ng WebSocket broadcast (tezroq UI)."""
+        # 1. DB ga yozish — polling shu yerdan oladi
+        _save_turn_partial(partial_update)
+        # 2. WebSocket broadcast (Celery'da fail bo'lishi mumkin — ahamiyat yo'q)
         try:
             _broadcast_turn({
                 "type": "TURN_RESULT",
