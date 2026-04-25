@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import datetime
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from celery.signals import (
     task_failure,
@@ -20,7 +20,7 @@ from celery.signals import (
 logger = logging.getLogger(__name__)
 
 
-def _extract_candidate_id(args: Any, kwargs: Any) -> int | None:
+def _extract_candidate_id(args: Any, kwargs: Any) -> Optional[int]:
     """Task argumentlaridan candidate_id ni ajratib olish."""
     if isinstance(kwargs, dict) and "candidate_id" in kwargs:
         cid = kwargs.get("candidate_id")

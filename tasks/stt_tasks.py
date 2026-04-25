@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from celery_app import celery_app
 
@@ -34,7 +34,7 @@ def transcribe_audio_task(
     self,
     audio_path: str,
     audio_url: str,
-    candidate_id: int | None = None,
+    candidate_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Audio faylni transkripsiya qiladi.
 
@@ -73,7 +73,7 @@ def transcribe_audio_task(
 
 
 def _write_stt_setting(task_id: str, audio_url: str, *, text: str = "",
-                        elapsed_ms: int = 0, error: str | None = None,
+                        elapsed_ms: int = 0, error: Optional[str] = None,
                         status: str = "done") -> None:
     """Backward-compat: frontend hozirgi ``stt_result_{task_id}`` poll mexanizmini ishlatadi."""
     from database import SessionLocal, GlobalSetting

@@ -19,7 +19,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
@@ -1110,7 +1110,6 @@ async def chat_knowledge_stream(
     import json as _json
     import time as _time
     import asyncio as _asyncio
-    from fastapi import Request as _FRequest  # noqa: F401
     from fastapi.responses import StreamingResponse
 
     query = (payload.query or "").strip()
@@ -1208,17 +1207,17 @@ async def chat_knowledge_stream(
 def _persist_chat_log(
     db: Session,
     *,
-    user_id: int | None,
+    user_id: Optional[int],
     role: str,
     query: str,
     answer: str,
-    confidence: int | None,
+    confidence: Optional[int],
     chunks_used: int,
     citations_count: int,
-    backend: str | None,
+    backend: Optional[str],
     latency_ms: int,
     streamed: bool,
-    error: str | None = None,
+    error: Optional[str] = None,
 ) -> None:
     """ChatQueryLog jadvaliga audit yozadi (analytics uchun)."""
     try:

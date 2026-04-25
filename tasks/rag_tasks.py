@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from celery_app import celery_app
 
@@ -24,7 +24,7 @@ def generate_ai_reply_task(
     self,
     user_message_id: int,
     prompt: str,
-    candidate_id: int | None = None,
+    candidate_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Chat xabariga AI javob generatsiya qilib DB ga yozadi.
 
