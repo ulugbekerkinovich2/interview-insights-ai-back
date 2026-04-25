@@ -22,6 +22,18 @@ from celery_app import celery_app
 logger = logging.getLogger(__name__)
 
 
+def _safe_prosody(audio_path: str) -> str:
+    """Prosody analiz — vaqt o'lchaydi, future.result() ga elapsed_ms qo'shadi."""
+    import logic as _logic
+    t0 = _time.time()
+    try:
+        result = _logic.run_voice_profiler(audio_path)
+    except Exception as e:
+        logger.warning(f"Voice profiler error: {e}")
+        result = ""
+    return result
+
+
 @celery_app.task(
     bind=True,
     name="tasks.process_turn_tasks.process_turn_full_task",
@@ -51,8 +63,23 @@ def process_turn_full_task(
     from sqlalchemy.orm.attributes import flag_modified
 
     analysis_db = SessionLocal()
+    # Progressive WebSocket broadcaster — har bosqich tugagandan keyin
+    # frontend ko'rsatadi (kutib o'tirish kamayadi: 15-25s -> ~3s percenedt latency)
+    def _broadcast_partial(partial_update: Dict[str, Any]) -> None:
+        try:
+            _broadcast_turn({
+                "type": "TURN_RESULT",
+                "candidate_id": candidate_id,
+                "question": question,
+                "audio_url": audio_url,
+                "turn_uid": turn_uid,
+                **partial_update,
+            })
+        except Exception as exc:
+            logger.debug(f"WS partial broadcast skipped: {exc}")
+
     try:
-        # 1. Whisper STT
+        # 1. Whisper STT — birinchi va eng tezroq ko'rsatish kerak bo'lgan natija
         transcript = ""
         stt_ms = 0
         t0 = _time.time()
@@ -63,25 +90,61 @@ def process_turn_full_task(
             transcript = "(Речь не распознана)"
         stt_wall_ms = int((_time.time() - t0) * 1000)
 
-        # 1b. Transcript smoothing
+        # ⚡ DARHOL: STT natijasini frontend'ga yuboramiz (foydalanuvchi
+        # transkriptni ~3 sekundda ko'radi, AI tahlilini esa keyinroq)
+        _broadcast_partial({
+            "answer": transcript,
+            "stt_ms": stt_ms,
+            "stt_wall_ms": stt_wall_ms,
+            "_stage": "stt_done",
+        })
+
+        # 2. Voice prosody — STT bilan parallel ishga tushirish mumkin (audio'dan).
+        # ThreadPoolExecutor orqali RAG bilan parallel ishlaymiz (RAG odatda 3-10s,
+        # prosody 0.5-2s — vaqt yutuq).
+        from concurrent.futures import ThreadPoolExecutor as _TP
+        _parallel_pool = _TP(max_workers=2, thread_name_prefix="turn-parallel")
+        prosody_started_at = _time.time()
+        prosody_future = _parallel_pool.submit(_safe_prosody, audio_path)
+
+        # 1b. Transcript smoothing — ixtiyoriy (env'da o'chirish mumkin tezlik uchun)
         transcript_raw = transcript
         smooth_ms = 0
-        t0 = _time.time()
-        try:
-            transcript = logic.smooth_transcript(transcript_raw) or transcript_raw
-        except Exception as e:
-            logger.warning(f"Transcript smoothing failed: {e}")
-            transcript = transcript_raw
-        smooth_ms = int((_time.time() - t0) * 1000)
+        smooth_enabled = os.getenv("TRANSCRIPT_SMOOTH", "true").lower() not in ("false", "0", "no")
+        if smooth_enabled and transcript and transcript != "(Речь не распознана)":
+            t0 = _time.time()
+            try:
+                transcript = logic.smooth_transcript(transcript_raw) or transcript_raw
+            except Exception as e:
+                logger.warning(f"Transcript smoothing failed: {e}")
+                transcript = transcript_raw
+            smooth_ms = int((_time.time() - t0) * 1000)
+            # Yangilangan transkriptni darhol ko'rsatamiz
+            if smooth_ms > 100:  # faqat sezilarli o'zgarish bo'lsa
+                _broadcast_partial({
+                    "answer": transcript,
+                    "candidate_raw": transcript_raw,
+                    "smooth_ms": smooth_ms,
+                    "_stage": "smooth_done",
+                })
 
-        # 2. Voice prosody
-        voice_raw = ""
-        t0 = _time.time()
+        # Prosody natijasini olamiz (RAG'dan oldin tugashi mumkin)
         try:
-            voice_raw = logic.run_voice_profiler(audio_path)
+            voice_raw = prosody_future.result(timeout=120)
+            prosody_ms = int((_time.time() - prosody_started_at) * 1000)
         except Exception as e:
             logger.warning(f"Voice profiler failed: {e}")
-        prosody_ms = int((_time.time() - t0) * 1000)
+            voice_raw = ""
+            prosody_ms = 0
+        finally:
+            _parallel_pool.shutdown(wait=False)
+
+        if voice_raw:
+            _broadcast_partial({
+                "voice_raw": voice_raw,
+                "prosody_ms": prosody_ms,
+                "_stage": "prosody_done",
+            })
 
         # 3. Face context + emotion aggregate
         face_context = ""
