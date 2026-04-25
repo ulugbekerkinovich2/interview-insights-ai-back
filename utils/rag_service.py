@@ -6,6 +6,7 @@ Falls back gracefully if Qdrant is unavailable.
 import os
 import logging
 import hashlib
+import threading
 from typing import List, Optional
 
 from .rag_metrics import metrics, now_ms
@@ -15,7 +16,11 @@ logger = logging.getLogger(__name__)
 
 # Lazy imports — don't crash if not installed
 _qdrant_client = None
+_qdrant_lock = threading.Lock()              # _get_qdrant() singleton uchun
+_collection_ready: bool = False              # ensure_collection() idempotent flag
+_collection_lock = threading.Lock()
 _embed_cache: dict = {}
+_embed_cache_lock = threading.Lock()         # cache iteratsiya/eviction race oldini olish
 _EMBED_CACHE_MAX = 2000
 
 QDRANT_URL = os.getenv("QDRANT_URL", "")
@@ -40,21 +45,26 @@ def embed_bucket_stats() -> dict:
 
 
 def _get_qdrant():
-    """Lazy init Qdrant client."""
+    """Lazy init Qdrant client — thread-safe (double-checked locking).
+    Aks holda 2 ta thread bir vaqtda klient yaratib, resurs leak bo'ladi."""
     global _qdrant_client
     if _qdrant_client is not None:
         return _qdrant_client
     if not QDRANT_URL:
         return None
-    api_key = QDRANT_API_KEY if QDRANT_API_KEY and QDRANT_API_KEY != "your_qdrant_key_here" else None
-    try:
-        from qdrant_client import QdrantClient
-        _qdrant_client = QdrantClient(url=QDRANT_URL, api_key=api_key, timeout=10)
-        logger.info(f"Qdrant connected: {QDRANT_URL}")
-        return _qdrant_client
-    except Exception as e:
-        logger.warning(f"Qdrant init failed: {e}")
-        return None
+    with _qdrant_lock:
+        # Lock olishidan oldin boshqa thread allaqachon yaratgan bo'lishi mumkin
+        if _qdrant_client is not None:
+            return _qdrant_client
+        api_key = QDRANT_API_KEY if QDRANT_API_KEY and QDRANT_API_KEY != "your_qdrant_key_here" else None
+        try:
+            from qdrant_client import QdrantClient
+            _qdrant_client = QdrantClient(url=QDRANT_URL, api_key=api_key, timeout=10)
+            logger.info(f"Qdrant connected: {QDRANT_URL}")
+            return _qdrant_client
+        except Exception as e:
+            logger.warning(f"Qdrant init failed: {e}")
+            return None
 
 
 def _embed_text(text: str) -> Optional[List[float]]:
@@ -62,11 +72,13 @@ def _embed_text(text: str) -> Optional[List[float]]:
     if not MISTRAL_API_KEY:
         return None
 
-    # Cache by text hash
+    # Cache by text hash — thread-safe read
     key = hashlib.md5(text.encode()).hexdigest()
-    if key in _embed_cache:
+    with _embed_cache_lock:
+        cached = _embed_cache.get(key)
+    if cached is not None:
         metrics.record_embed(elapsed_ms=0.0, cache_hit=True)
-        return _embed_cache[key]
+        return cached
 
     if not _embed_bucket.acquire(timeout=_EMBED_WAIT_TIMEOUT):
         logger.warning("Mistral embed rate limit exceeded; skipping embedding")
@@ -84,12 +96,14 @@ def _embed_text(text: str) -> Optional[List[float]]:
         )
         resp.raise_for_status()
         vector = resp.json()["data"][0]["embedding"]
-        if len(_embed_cache) >= _EMBED_CACHE_MAX:
-            # Evict oldest half
-            keys = list(_embed_cache.keys())
-            for k in keys[:len(keys) // 2]:
-                del _embed_cache[k]
-        _embed_cache[key] = vector
+        # Eviction + insert — lock ostida (avvalda RuntimeError xavfi bor edi)
+        with _embed_cache_lock:
+            if len(_embed_cache) >= _EMBED_CACHE_MAX:
+                # Evict oldest half (FIFO order — Python 3.7+ dict ordered)
+                keys = list(_embed_cache.keys())
+                for k in keys[: len(keys) // 2]:
+                    _embed_cache.pop(k, None)
+            _embed_cache[key] = vector
         metrics.record_embed(elapsed_ms=now_ms() - t0)
         return vector
     except Exception as e:
@@ -99,23 +113,37 @@ def _embed_text(text: str) -> Optional[List[float]]:
 
 
 def ensure_collection():
-    """Create Qdrant collection if it doesn't exist."""
+    """Create Qdrant collection if it doesn't exist — thread-safe + idempotent.
+    Lock orqali bir vaqtda 2 ta admin approve qilsa, ikkalasi ham collection
+    yaratishga urinmaydi (avvalda silent fail edi → indekslash buzilardi)."""
+    global _collection_ready
+    if _collection_ready:
+        return True
     client = _get_qdrant()
     if not client:
         return False
-    try:
-        from qdrant_client.models import Distance, VectorParams
-        collections = [c.name for c in client.get_collections().collections]
-        if QDRANT_COLLECTION not in collections:
-            client.create_collection(
-                collection_name=QDRANT_COLLECTION,
-                vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
-            )
-            logger.info(f"Created Qdrant collection: {QDRANT_COLLECTION}")
-        return True
-    except Exception as e:
-        logger.warning(f"Qdrant collection check failed: {e}")
-        return False
+    with _collection_lock:
+        if _collection_ready:
+            return True
+        try:
+            from qdrant_client.models import Distance, VectorParams
+            collections = [c.name for c in client.get_collections().collections]
+            if QDRANT_COLLECTION not in collections:
+                client.create_collection(
+                    collection_name=QDRANT_COLLECTION,
+                    vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+                )
+                logger.info(f"Created Qdrant collection: {QDRANT_COLLECTION}")
+            _collection_ready = True
+            return True
+        except Exception as e:
+            # "already exists" xatoligi konkurent yaratish bo'lsa — bu OK
+            err_str = str(e).lower()
+            if "already exists" in err_str or "conflict" in err_str:
+                _collection_ready = True
+                return True
+            logger.warning(f"Qdrant collection check failed: {e}")
+            return False
 
 
 def add_document(text: str, metadata: dict = None, doc_id: str = None) -> bool:

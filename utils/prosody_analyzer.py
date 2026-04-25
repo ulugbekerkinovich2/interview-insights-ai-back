@@ -1,3 +1,4 @@
+import os
 import sys
 import warnings
 import numpy as np
@@ -6,6 +7,12 @@ warnings.filterwarnings("ignore", category=UserWarning, module="librosa")
 warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")
 
 import librosa
+
+# Pitch detection algoritmi tanlovi:
+#   "yin"  — tezroq (~200-500ms 30s audio uchun), aniqligi etarli ko'pchilik holatlarda
+#   "pyin" — aniqroq (~2-4 sekund), lekin process-turn ni 2x sekinlashtiradi
+# Default "yin" — tezlik uchun. Sifatga muhim bo'lsa env orqali "pyin" tanlash mumkin.
+PITCH_ALGORITHM = os.getenv("PROSODY_PITCH_ALGO", "yin").lower()
 
 
 def analyze_prosody(audio_path):
@@ -17,9 +24,22 @@ def analyze_prosody(audio_path):
 
         duration = len(y) / sr
 
-        # 1. Pitch (F0) — use pyin for more accurate fundamental frequency
-        f0, voiced_flag, _ = librosa.pyin(y, fmin=60, fmax=500, sr=sr)
-        f0_voiced = f0[voiced_flag] if voiced_flag is not None else f0[~np.isnan(f0)]
+        # 1. Pitch (F0) — `yin` (tez) yoki `pyin` (aniqroq, lekin sekin).
+        # `pyin` 30 sek audio uchun ~2-4 sek CPU vaqt talab qiladi (FFT-based O(N²)).
+        # `yin` esa ~200-500 ms — process-turn endpointini sezilarli tezlashtiradi.
+        if PITCH_ALGORITHM == "pyin":
+            f0, voiced_flag, _ = librosa.pyin(y, fmin=60, fmax=500, sr=sr)
+            f0_voiced = f0[voiced_flag] if voiced_flag is not None else f0[~np.isnan(f0)]
+        else:
+            # YIN — voiced flag qaytarmaydi, NaN'larni filtrlaymiz
+            f0 = librosa.yin(y, fmin=60, fmax=500, sr=sr)
+            # YIN hech qachon NaN bermaydi, lekin energy past joylarda noise beradi.
+            # Energy thresholdi bilan voiced frame'larni ajratamiz.
+            rms_quick = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)[0]
+            # YIN va RMS bir xil hop_length da ekanligini ta'minlaymiz
+            min_len = min(len(f0), len(rms_quick))
+            voiced_mask = rms_quick[:min_len] > (np.mean(rms_quick) * 0.3)
+            f0_voiced = f0[:min_len][voiced_mask]
         f0_voiced = f0_voiced[~np.isnan(f0_voiced)]
 
         if len(f0_voiced) > 5:

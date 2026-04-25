@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import List, Optional, Dict
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, Header, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, Header, Request, Response, Cookie
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -33,10 +33,50 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# #32 — Sentry error tracking (ixtiyoriy). SDK yo'q bo'lsa silent skip.
+# Yoqish uchun: pip install sentry-sdk + .env'da SENTRY_DSN=...
+_SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
+if _SENTRY_DSN:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.fastapi import FastApiIntegration
+        from sentry_sdk.integrations.starlette import StarletteIntegration
+
+        sentry_sdk.init(
+            dsn=_SENTRY_DSN,
+            integrations=[StarletteIntegration(), FastApiIntegration()],
+            traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
+            send_default_pii=False,  # PII tashlamaymiz (GDPR)
+            environment=os.getenv("ENVIRONMENT", "development"),
+        )
+        logger.info("Sentry initialized")
+    except ImportError:
+        logger.warning("SENTRY_DSN set but sentry-sdk not installed: pip install sentry-sdk")
+    except Exception as exc:
+        logger.warning(f"Sentry init failed: {exc}")
+
 import database
 import schemas
 import logic
 from api.knowledge import router as knowledge_router
+from utils.executor import (
+    stt_executor, llm_executor, frame_executor, run_bounded, QueueFull, pool_stats,
+    shutdown_all as _shutdown_executors,
+)
+
+# Celery queue — agar Redis mavjud bo'lsa ishlatamiz, aks holda threading fallback.
+# ``CELERY_ENABLED=false`` bilan ham to'liq o'chirib qo'yish mumkin.
+try:
+    from celery_app import celery_app, celery_enabled  # noqa: F401
+    from tasks.stt_tasks import transcribe_audio_task
+    from tasks.rag_tasks import generate_ai_reply_task
+    from tasks.process_turn_tasks import process_turn_full_task
+    _CELERY_IMPORTED = True
+except Exception as _celery_import_exc:  # pragma: no cover
+    _CELERY_IMPORTED = False
+    logging.getLogger(__name__).warning(
+        f"Celery import failed — threading fallback ishlatiladi: {_celery_import_exc}"
+    )
 
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BACKEND_DIR.parent
@@ -49,19 +89,36 @@ load_dotenv(BACKEND_DIR / ".env")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+from concurrent.futures import ThreadPoolExecutor as _TPExec
+
+# Bounded Telegram pool — har turn'da yangi thread spawn qilmaslik uchun.
+# 1000 ta tez yuborish bo'lsa ham faqat 4 thread ishlatiladi.
+_telegram_pool = _TPExec(max_workers=4, thread_name_prefix="tg-pool")
+
+
 def send_telegram_notification(message: str):
+    """Fire-and-forget Telegram xabari — bounded thread pool orqali (#21).
+    Cheksiz thread spawn xavfini yo'q qiladi."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
-        "parse_mode": "HTML"
+        "parse_mode": "HTML",
     }
+
+    def _send():
+        try:
+            requests.post(url, json=payload, timeout=5)
+        except Exception as e:
+            logger.warning(f"Telegram error: {e}")
+
     try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        print(f"Telegram error: {e}")
+        _telegram_pool.submit(_send)
+    except Exception:
+        # Pool yopilgan bo'lsa (shutdown) — silent skip
+        pass
 
 PASSWORD_HASH_PREFIX = "bcrypt_sha256$"
 
@@ -126,6 +183,233 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 ADMIN_MEDIA_ROLES = {"SuperAdmin", "Recruiter", "Psychologist"}
+
+
+# --- WebSocket rate limiter ---
+# HTTP endpoint'lar slowapi'dan foydalanadi, lekin WebSocket endpoint'lar
+# (notifications, live-analysis, webrtc) himoya qilinmagan edi → DoS xavfi.
+# Per-user va per-IP soddalashtirilgan in-memory counter.
+import collections as _collections
+
+_WS_MAX_PER_KEY = int(os.getenv("WS_MAX_CONNECTIONS_PER_USER", "5"))
+_WS_WINDOW_SEC = int(os.getenv("WS_WINDOW_SEC", "60"))
+_ws_connections: dict = _collections.defaultdict(list)  # key -> [timestamp, ...]
+_ws_conn_lock = __import__("threading").Lock()
+
+
+def _ws_rate_limit_check(key: str) -> bool:
+    """True qaytarsa ulanishga ruxsat. False qaytarsa rad etish."""
+    import time as _t
+    now = _t.time()
+    with _ws_conn_lock:
+        timestamps = _ws_connections[key]
+        # Eski timestamplarni tozalash
+        timestamps[:] = [t for t in timestamps if now - t < _WS_WINDOW_SEC]
+        if len(timestamps) >= _WS_MAX_PER_KEY:
+            return False
+        timestamps.append(now)
+        return True
+
+
+def _ws_dict_gc() -> int:
+    """#20 — _ws_connections dict ning bo'sh kalitlarini tozalaydi
+    (cheksiz o'sishni oldini oladi). Periodic background task chaqiradi."""
+    import time as _t
+    now = _t.time()
+    removed = 0
+    with _ws_conn_lock:
+        empty_keys = []
+        for k, ts_list in _ws_connections.items():
+            ts_list[:] = [t for t in ts_list if now - t < _WS_WINDOW_SEC]
+            if not ts_list:
+                empty_keys.append(k)
+        for k in empty_keys:
+            _ws_connections.pop(k, None)
+            removed += 1
+    return removed
+
+
+def _ws_extract_token(websocket: WebSocket, query_token: Optional[str]) -> Optional[str]:
+    """#16 — Token'ni 2 ta joydan oladi: query param yoki HttpOnly cookie.
+    Cookie ustun bo'ladi (XSS-himoyali)."""
+    cookie_header = websocket.headers.get("cookie") or ""
+    for part in cookie_header.split(";"):
+        part = part.strip()
+        if part.startswith("admin_token="):
+            return part.split("=", 1)[1]
+    return query_token
+
+
+def _ws_rate_key_from_token(token: Optional[str], fallback: str) -> str:
+    """JWT bor bo'lsa user-based, aks holda IP-based key."""
+    if token:
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            sub = payload.get("sub")
+            if sub:
+                return f"user:{sub}"
+        except JWTError:
+            pass
+    return f"ip:{fallback}"
+
+# --- Upload validation (size + MIME + extension) ---
+# Hajm chegaralari .env orqali sozlanadi
+MAX_AUDIO_UPLOAD_BYTES = int(os.getenv("MAX_AUDIO_UPLOAD_MB", "50")) * 1024 * 1024
+MAX_IMAGE_UPLOAD_BYTES = int(os.getenv("MAX_IMAGE_UPLOAD_MB", "10")) * 1024 * 1024
+# Global per-request tana hajmi cheklovi (multipart uchun ham). Audio eng katta tur.
+MAX_REQUEST_BODY_BYTES = max(MAX_AUDIO_UPLOAD_BYTES, MAX_IMAGE_UPLOAD_BYTES) + 2 * 1024 * 1024  # +2 MB headers/form padding
+
+ALLOWED_AUDIO_MIMES = {
+    "audio/webm", "audio/ogg", "audio/wav", "audio/x-wav", "audio/wave",
+    "audio/mpeg", "audio/mp3", "audio/mp4", "audio/m4a", "audio/x-m4a",
+    "audio/aac", "audio/flac",
+    # Brauzer MediaRecorder ko'pincha audio-only oqimni video/webm sifatida yuboradi
+    "video/webm",
+    # Ba'zi brauzerlar blob uchun generic MIME yuboradi — ext tekshiruvi himoya qiladi
+    "application/octet-stream",
+}
+ALLOWED_AUDIO_EXTS = {".webm", ".ogg", ".oga", ".wav", ".mp3", ".m4a", ".mp4", ".aac", ".flac"}
+
+ALLOWED_IMAGE_MIMES = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
+ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+_MIME_TO_EXT = {
+    "audio/webm": ".webm", "video/webm": ".webm",
+    "audio/ogg": ".ogg", "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
+    "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a", "audio/m4a": ".m4a", "audio/x-m4a": ".m4a",
+    "audio/aac": ".aac", "audio/flac": ".flac",
+    "image/jpeg": ".jpg", "image/jpg": ".jpg",
+    "image/png": ".png", "image/webp": ".webp",
+}
+
+
+def _validate_upload_mime(
+    file: UploadFile,
+    allowed_mimes: set,
+    allowed_exts: set,
+    label: str,
+    default_ext: str,
+) -> str:
+    """MIME va kengaytmani tekshiradi. Xavfsiz kengaytmani (nuqta bilan) qaytaradi.
+
+    Har ikkalasi ham (ext va content-type) mavjud bo'lsa, ikkisi ham whitelistda bo'lishi shart.
+    Faqat bittasi bo'lsa, shu bittasi whitelistda bo'lishi kifoya.
+    """
+    ctype = (file.content_type or "").lower().split(";")[0].strip()
+    raw_ext = os.path.splitext(file.filename or "")[1].lower()
+
+    if raw_ext and raw_ext not in allowed_exts:
+        raise HTTPException(status_code=415, detail=f"Ruxsat etilmagan {label} kengaytmasi: {raw_ext}")
+    # application/octet-stream ni faqat ext ma'lum bo'lsa ruxsat etamiz
+    if ctype and ctype not in allowed_mimes:
+        raise HTTPException(status_code=415, detail=f"Ruxsat etilmagan {label} turi: {ctype}")
+    if ctype == "application/octet-stream" and not raw_ext:
+        raise HTTPException(status_code=415, detail=f"{label} fayl turi aniqlanmadi")
+
+    if raw_ext:
+        return raw_ext
+    inferred = _MIME_TO_EXT.get(ctype)
+    return inferred or default_ext
+
+
+def _stream_upload_to_path(
+    file: UploadFile,
+    dest_path: Path,
+    max_bytes: int,
+    label: str,
+) -> int:
+    """UploadFile ni dest_path ga yozadi, max_bytes dan oshsa 413 qaytaradi.
+    Qisman yozilgan faylni o'chiradi. Yozilgan baytlar sonini qaytaradi.
+    """
+    CHUNK = 1024 * 1024  # 1 MB
+    written = 0
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(dest_path, "wb") as out:
+            while True:
+                chunk = file.file.read(CHUNK)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"{label} hajmi {max_bytes // (1024*1024)} MB dan oshib ketdi",
+                    )
+                out.write(chunk)
+    except HTTPException:
+        try:
+            dest_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+    except Exception as exc:
+        try:
+            dest_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Faylni saqlashda xato: {exc}")
+    if written == 0:
+        try:
+            dest_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail=f"{label} fayli bo'sh")
+    return written
+
+
+def _read_upload_bytes(file: UploadFile, max_bytes: int, label: str) -> bytes:
+    """UploadFile ni xotiraga o'qiydi, hajm cheklovini majburlaydi."""
+    data = file.file.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{label} hajmi {max_bytes // (1024*1024)} MB dan oshib ketdi",
+        )
+    if not data:
+        raise HTTPException(status_code=400, detail=f"{label} fayli bo'sh")
+    return data
+
+
+# --- Path traversal himoya ---
+_SAFE_FILENAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def _safe_media_path(base_dir: Path, filename: str) -> Path:
+    """Path traversal hujumidan himoya qiladi.
+
+    Fayl nomi xavfsizligini tekshiradi: ``..``, yo'l ajratgichlari, null bayt va
+    unicode hiylalarni rad etadi. ``Path.resolve()`` orqali kanonik yo'l
+    ``base_dir`` ichida ekanligini majburlaydi (symlink/relative hujumlarga qarshi).
+
+    Xatolik turlari
+    ---------------
+    * ``400`` — fayl nomi noto'g'ri formatda yoki taqiqlangan belgilar bor
+    * ``403`` — yo'l ``base_dir`` tashqarisiga chiqadi
+    * ``404`` — fayl mavjud emas yoki katalog
+    """
+    if not filename or len(filename) > 255:
+        raise HTTPException(status_code=400, detail="Noto'g'ri fayl nomi")
+    forbidden_chars = ("..", "/", "\\", "\x00")
+    if any(ch in filename for ch in forbidden_chars):
+        raise HTTPException(status_code=400, detail="Noto'g'ri fayl nomi")
+    if not _SAFE_FILENAME_RE.fullmatch(filename):
+        raise HTTPException(status_code=400, detail="Noto'g'ri fayl nomi formati")
+
+    try:
+        base_resolved = base_dir.resolve()
+        candidate = (base_dir / filename).resolve()
+        # relative_to() xato chiqadi agar candidate base tashqarisida bo'lsa
+        candidate.relative_to(base_resolved)
+    except (ValueError, OSError):
+        raise HTTPException(status_code=403, detail="Ruxsat etilmagan yo'l")
+
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Fayl topilmadi")
+    return candidate
+
+
 DEFAULT_FEATURE_FLAGS = [
     {"name": "linkedin_search", "description": "Nomzod profilida LinkedIn qidiruv tugmasini ko'rsatish", "is_enabled": True},
     {"name": "pdf_export", "description": "Nomzod profilidan PDF hisobot eksportini yoqish", "is_enabled": True},
@@ -142,6 +426,8 @@ class WebRTCRoom:
     def __init__(self):
         self.admin: Optional[WebSocket] = None
         self.candidate: Optional[WebSocket] = None
+        # Admin takeover'ni oldini olish — kim hozirda admin ekanligini saqlaymiz
+        self.admin_email: Optional[str] = None
         # Buffer signaling messages if peer is not connected yet.
         self.pending_for_admin: List[dict] = []
         self.pending_for_candidate: List[dict] = []
@@ -169,14 +455,44 @@ class WebRTCRoom:
 import threading
 webrtc_rooms: Dict[int, WebRTCRoom] = {}
 _rooms_lock = threading.Lock()
+# Room oxirgi faolligi vaqti — stale roomlarni avtomatik tozalash uchun.
+_webrtc_room_last_active: Dict[int, float] = {}
+# Stale room TTL — 30 daqiqa faolsiz bo'lgan roomlar o'chiriladi (memory leak oldini olish)
+WEBRTC_ROOM_TTL_SEC = int(os.getenv("WEBRTC_ROOM_TTL_SEC", "1800"))
+# Server ishga tushirilgan vaqt — frontend restart aniqlash uchun /health/detail da
+SERVER_STARTED_AT = datetime.datetime.utcnow().isoformat() + "Z"
+
 
 def _get_room(candidate_id: int) -> WebRTCRoom:
+    import time as _time
     with _rooms_lock:
         room = webrtc_rooms.get(candidate_id)
         if room is None:
             room = WebRTCRoom()
             webrtc_rooms[candidate_id] = room
+        _webrtc_room_last_active[candidate_id] = _time.time()
         return room
+
+
+def _cleanup_stale_webrtc_rooms() -> int:
+    """Uzoq vaqt faolsiz roomlarni tozalaydi (memory leak oldini oladi).
+    Periodic task chaqiriladi."""
+    import time as _time
+    now = _time.time()
+    removed = 0
+    with _rooms_lock:
+        for cid in list(webrtc_rooms.keys()):
+            last = _webrtc_room_last_active.get(cid, 0)
+            if now - last > WEBRTC_ROOM_TTL_SEC:
+                room = webrtc_rooms.get(cid)
+                # Faol WS connectionlari bormi — tekshirmaymiz, chunki
+                # ular yopilganda room allaqachon tozalanadi. Bu faqat
+                # yarim yopilgan (zombie) roomlar uchun.
+                if room and room.admin is None and room.candidate is None:
+                    webrtc_rooms.pop(cid, None)
+                    _webrtc_room_last_active.pop(cid, None)
+                    removed += 1
+    return removed
 
 def create_candidate_token(candidate_id: int, expires_minutes: int = 60 * 24) -> str:
     return create_access_token(
@@ -185,18 +501,88 @@ def create_candidate_token(candidate_id: int, expires_minutes: int = 60 * 24) ->
     )
 
 # --- Security Config ---
-# Ensure SECRET_KEY is set via environment variable for production
+# SECRET_KEY — JWT imzo uchun. Prod muhitlarida ``.env`` dan olinishi SHART.
+# Prod-ga yaqin nomlardagi muhitlarda (production/prod/staging/live) SECRET_KEY
+# bo'lmasa yoki placeholder qiymatda bo'lsa server startup da to'xtaydi.
+# Dev/test muhitlarida har protsess boshlanishida yangi random kalit yaratiladi
+# (restart da barcha JWT tokenlar avtomatik bekor bo'ladi — bu hardcoded
+# secretdan xavfsizroq, chunki kod commit qilinsa ham real xavf yo'q).
+_PROD_ENV_NAMES = {"production", "prod", "staging", "live"}
+_env_name = (os.getenv("ENVIRONMENT") or "").lower()
+_is_prod_env = _env_name in _PROD_ENV_NAMES
+
 SECRET_KEY = os.getenv("SECRET_KEY")
+_SECRET_KEY_SOURCE = "env"
+
+if SECRET_KEY and SECRET_KEY.startswith("CHANGE_ME"):
+    # `.env.example` dagi placeholder qiymat — prodda qabul qilmaymiz
+    if _is_prod_env:
+        raise RuntimeError(
+            "FATAL: SECRET_KEY placeholder qiymatda ('CHANGE_ME...'). "
+            "Haqiqiy kalit yarating: "
+            "python3 -c 'import secrets; print(secrets.token_urlsafe(48))'"
+        )
+    logger.warning(
+        "SECRET_KEY placeholder qiymatda ('CHANGE_ME...') — dev rejimida ishlaydi, "
+        "lekin prodda xavfli. Haqiqiy kalit o'rnating."
+    )
+
 if not SECRET_KEY:
-    # In development, we can allow a default, but warn. In production, this should fail.
-    if os.getenv("ENVIRONMENT") == "production":
-        raise RuntimeError("FATAL: SECRET_KEY is not set in environment variables!")
-    SECRET_KEY = "DEV_DEBUG_SECRET_ONLY_DO_NOT_USE_IN_PROD"
+    if _is_prod_env:
+        raise RuntimeError(
+            f"FATAL: SECRET_KEY muhit o'zgaruvchisi belgilanmagan (ENVIRONMENT={_env_name!r}). "
+            "Ishga tushirish uchun: export SECRET_KEY=$(python3 -c "
+            "'import secrets; print(secrets.token_urlsafe(48))')"
+        )
+    # Dev/test: har protsess uchun yangi random kalit
+    SECRET_KEY = secrets.token_urlsafe(48)
+    _SECRET_KEY_SOURCE = "random_per_process"
+    logger.warning(
+        "SECRET_KEY .env da yo'q — dev uchun random kalit generatsiya qilindi. "
+        "Server restart da barcha JWT tokenlar bekor bo'ladi. "
+        "Prod uchun: export SECRET_KEY=... (.env faylga yozing)"
+    )
 
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 24 hours
 
-limiter = Limiter(key_func=get_remote_address)
+def _user_or_ip_key(request: Request) -> str:
+    """Rate limit kaliti: autentifikatsiyalangan foydalanuvchilar uchun JWT ``sub``
+    (har user alohida chegara), aks holda IP asosida. NAT ortidagi ko'plab
+    foydalanuvchilarni jarimaga tortmaslik uchun mos.
+    """
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        try:
+            payload = jwt.decode(auth[7:], SECRET_KEY, algorithms=[ALGORITHM])
+            sub = payload.get("sub")
+            if sub:
+                return f"user:{sub}"
+        except JWTError:
+            pass
+    # Candidate tokenlar query param yoki cookie da kelishi mumkin — fallback
+    token_param = request.query_params.get("token")
+    if token_param:
+        try:
+            payload = jwt.decode(token_param, SECRET_KEY, algorithms=[ALGORITHM])
+            sub = payload.get("sub")
+            if sub:
+                return f"user:{sub}"
+        except JWTError:
+            pass
+    return get_remote_address(request)
+
+
+# Rate limit chegaralari ``.env`` dan o'qiladi (har endpoint uchun alohida)
+RL_TRANSCRIBE = os.getenv("RATE_LIMIT_TRANSCRIBE", "30/minute")
+RL_PROCESS_TURN = os.getenv("RATE_LIMIT_PROCESS_TURN", "20/minute")
+RL_UPLOAD_AUDIO = os.getenv("RATE_LIMIT_UPLOAD_AUDIO", "60/minute")
+RL_ANALYZE_FRAME = os.getenv("RATE_LIMIT_ANALYZE_FRAME", "120/minute")
+RL_FACE_AI = os.getenv("RATE_LIMIT_FACE_AI", "30/minute")
+RL_CHAT = os.getenv("RATE_LIMIT_CHAT", "30/minute")
+
+
+limiter = Limiter(key_func=_user_or_ip_key)
 app = FastAPI(title="AI Interview Backend API")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -207,9 +593,36 @@ def create_access_token(data: dict, expires_delta: Optional[datetime.timedelta] 
         expire = datetime.datetime.utcnow() + expires_delta
     else:
         expire = datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
-    to_encode.update({"exp": expire})
+    # #19 — har token uchun jti (JWT ID) — revocation list'da kalit
+    to_encode.update({"exp": expire, "jti": secrets.token_urlsafe(16)})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+
+
+# #19 — JWT revocation list. Kalit: jti, qiymat: revoke timestamp.
+# In-memory (single-process). Multi-process uchun Redis bilan almashtirsh kerak.
+_revoked_jtis: Dict[str, float] = {}
+_revoked_lock = __import__("threading").Lock()
+
+
+def _is_token_revoked(jti: str) -> bool:
+    if not jti:
+        return False
+    with _revoked_lock:
+        return jti in _revoked_jtis
+
+
+def _revoke_token(jti: str) -> None:
+    if not jti:
+        return
+    import time as _t
+    with _revoked_lock:
+        _revoked_jtis[jti] = _t.time()
+        # Eski (24 soatdan ko'p) entry'larni tozalash — token TTL o'tgan bo'lsa
+        cutoff = _t.time() - 24 * 3600
+        for k in list(_revoked_jtis.keys()):
+            if _revoked_jtis[k] < cutoff:
+                _revoked_jtis.pop(k, None)
 
 # Add Restricted CORS middleware
 # Only allow known origins (add your production domain here)
@@ -225,13 +638,45 @@ ALLOWED_ORIGINS = [
     "https://api.ufqpai.uz",
 ]
 
+# #18 — CORS: explicit origins + regex pattern (subdomenlar va localhost portlari)
+# `allow_credentials=True` cookie auth uchun shart, lekin u `*` bilan ishlamaydi.
+_ALLOWED_ORIGIN_REGEX = os.getenv(
+    "CORS_ALLOW_ORIGIN_REGEX",
+    r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$|^https://([a-z0-9-]+\.)*(misterdev\.uz|ufqpai\.uz)$",
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=_ALLOWED_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Set-Cookie"],
 )
+
+
+@app.middleware("http")
+async def limit_request_body(request: Request, call_next):
+    """Early guard: Content-Length bilan kelgan haddan tashqari katta POST/PUT/PATCH ni
+    Starlette tanasini bufferlashdan oldin rad etadi. Multipart yuklashlarda
+    disk/xotira ekzozini oldini oladi."""
+    if request.method in ("POST", "PUT", "PATCH"):
+        cl = request.headers.get("content-length")
+        if cl is not None:
+            try:
+                if int(cl) > MAX_REQUEST_BODY_BYTES:
+                    return JSONResponse(
+                        status_code=413,
+                        content={
+                            "detail": f"So'rov tanasi {MAX_REQUEST_BODY_BYTES // (1024*1024)} MB dan oshib ketdi"
+                        },
+                    )
+            except ValueError:
+                # Noto'g'ri Content-Length — quyidagi oddiy ishlov beruvchilarga qoldiramiz
+                pass
+    return await call_next(request)
+
 
 # Role-based RAG knowledge-base API (/knowledge/*).
 app.include_router(knowledge_router)
@@ -268,6 +713,109 @@ async def startup():
         # Do not crash startup; settings page will surface this if DB/migrations are missing.
         print(f"feature-flag bootstrap skipped: {exc}")
 
+    # Stale Celery jobs cleanup — server restart qilinganda "running" yoki "queued"
+    # holatida qolgan JobRecord yozuvlarini "failed" ga o'zgartirish. Bu yozuvlarni
+    # kutayotgan klientlar yangi urinishni boshlashi mumkin.
+    try:
+        with SessionLocal() as db:
+            stale = (
+                db.query(database.JobRecord)
+                .filter(database.JobRecord.status.in_(["running", "queued"]))
+                .all()
+            )
+            if stale:
+                for rec in stale:
+                    rec.status = "failed"
+                    rec.error = (rec.error or "") + " [server restart — stale job]"
+                    rec.finished_at = datetime.datetime.utcnow()
+                db.commit()
+                logger.info(f"Stale Celery jobs cleaned: {len(stale)}")
+    except Exception as exc:
+        logger.warning(f"stale-jobs cleanup skipped: {exc}")
+
+    # Whisper idle TTL eviction — har 60 sekund tekshiradi, foydalanilmagan
+    # modelni xotiradan bo'shatadi. Server tugasa task ham tugaydi.
+    async def _whisper_idle_watcher():
+        while True:
+            try:
+                await asyncio.sleep(60)
+                logic._evict_if_idle()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning(f"whisper idle watcher: {exc}")
+
+    # WebRTC stale rooms tozalash — har 5 daqiqa
+    async def _webrtc_rooms_watcher():
+        while True:
+            try:
+                await asyncio.sleep(300)
+                n = _cleanup_stale_webrtc_rooms()
+                if n:
+                    logger.info(f"WebRTC stale rooms cleaned: {n}")
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning(f"webrtc rooms watcher: {exc}")
+
+    # #20 — WS connection dict cleanup (cheksiz o'sishni oldini oladi)
+    async def _ws_dict_cleanup_watcher():
+        while True:
+            try:
+                await asyncio.sleep(3600)  # har 1 soat
+                n = _ws_dict_gc()
+                if n:
+                    logger.info(f"WS connection dict cleaned: {n} keys removed")
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning(f"ws dict cleanup watcher: {exc}")
+
+    # Frame disk cleanup — har 5 daqiqa, eski 2 soatdan ko'p faollarni o'chiradi.
+    # Eski probabilistic 1% chance o'rniga deterministic — disk fill xavfini yo'q qiladi.
+    async def _frames_cleanup_watcher():
+        frames_dir = MEDIA_DIR / "frames"
+        while True:
+            try:
+                await asyncio.sleep(300)
+                if not frames_dir.exists():
+                    continue
+                _prune_old_frames(frames_dir, max_age_sec=2 * 3600)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning(f"frames cleanup watcher: {exc}")
+
+    try:
+        app.state.whisper_watcher = asyncio.create_task(_whisper_idle_watcher())
+        app.state.webrtc_watcher = asyncio.create_task(_webrtc_rooms_watcher())
+        app.state.frames_watcher = asyncio.create_task(_frames_cleanup_watcher())
+        app.state.ws_dict_watcher = asyncio.create_task(_ws_dict_cleanup_watcher())
+    except Exception as exc:
+        logger.warning(f"watcher start failed: {exc}")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Graceful shutdown — bounded executorlarni yopadi, Whisper modelni
+    bo'shatadi, background tasklarni to'xtatadi."""
+    for attr in ("whisper_watcher", "webrtc_watcher", "frames_watcher", "ws_dict_watcher"):
+        try:
+            task = getattr(app.state, attr, None)
+            if task:
+                task.cancel()
+        except Exception:
+            pass
+    try:
+        logic.release_whisper_model()
+    except Exception:
+        pass
+    try:
+        _shutdown_executors()
+    except Exception:
+        pass
+
+
 # Dependency to get DB session
 def get_db():
     db = SessionLocal()
@@ -279,18 +827,31 @@ def get_db():
 from fastapi.security import OAuth2PasswordBearer
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
-# User context for RBAC using JWT
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    if not token:
+# User context for RBAC using JWT.
+# Tokenni 2 ta joydan qabul qiladi:
+#   1) `Authorization: Bearer ...` header (mavjud usul, frontend hozirgi)
+#   2) `admin_token` HttpOnly cookie (yangi, XSS-himoyali — kelajakda asosiy)
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    admin_token_cookie: Optional[str] = Cookie(default=None, alias="admin_token"),
+    db: Session = Depends(get_db),
+):
+    # Cookie ustun bo'lsin — XSS himoyasi uchun (Bearer header endi fallback)
+    effective_token = admin_token_cookie or token
+    if not effective_token:
         return None
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(effective_token, SECRET_KEY, algorithms=[ALGORITHM])
         email: str = payload.get("sub")
+        jti: str = payload.get("jti", "")
         if email is None:
+            return None
+        # #19 — revocation list tekshiruvi (logout qilingan tokenlar)
+        if jti and _is_token_revoked(jti):
             return None
     except JWTError:
         return None
-        
+
     user = db.query(database.User).filter_by(email=email).first()
     return user
 
@@ -395,9 +956,7 @@ def get_protected_frame(
     if role not in ADMIN_MEDIA_ROLES:
         raise HTTPException(status_code=403, detail="Ushbu rasmga kirish uchun ruxsat yo'q")
 
-    file_path = MEDIA_DIR / "frames" / filename
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Rasm topilmadi")
+    file_path = _safe_media_path(MEDIA_DIR / "frames", filename)
     from fastapi.responses import FileResponse
     return FileResponse(file_path)
 
@@ -421,9 +980,7 @@ def get_protected_audio(
     if role not in ADMIN_MEDIA_ROLES and role != "Candidate":
         raise HTTPException(status_code=403, detail="Audio faylga kirish uchun ruxsat yo'q")
 
-    file_path = MEDIA_AUDIO_DIR / filename
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Audio fayl topilmadi")
+    file_path = _safe_media_path(MEDIA_AUDIO_DIR, filename)
     from fastapi.responses import FileResponse
     media_type = "audio/webm" if filename.endswith(".webm") else "audio/ogg" if filename.endswith(".ogg") else "audio/wav"
     file_size = file_path.stat().st_size
@@ -456,6 +1013,117 @@ def health_check():
         },
     }
 
+
+@app.get("/health/detail")
+def health_detail(_: database.User = Depends(require_admin)):
+    """Kengaytirilgan diagnostika: thread pool yuklamasi, Whisper holati,
+    AI xarajat holati. Faqat admin rolliga ruxsat."""
+    try:
+        db_ok = True
+        database.check_database_connection()
+    except Exception as exc:
+        db_ok = False
+
+    from utils import cost_tracker
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "server_started_at": SERVER_STARTED_AT,
+        "database": {
+            "available": db_ok,
+            "dialect": database.get_database_metadata()["dialect"],
+        },
+        "whisper": logic.whisper_status(),
+        "thread_pools": pool_stats(),
+        "ai_cost": cost_tracker.stats(),
+        "webrtc": {
+            "active_rooms": len(webrtc_rooms),
+            "ttl_sec": WEBRTC_ROOM_TTL_SEC,
+        },
+    }
+
+
+@app.get("/health/cost")
+def health_cost(_: database.User = Depends(require_admin)):
+    """AI xarajat holati — Mistral va Deepgram uchun sutkali/oylik summa.
+    Chegarani oshsa AI chaqiruvlari bloklanadi."""
+    from utils import cost_tracker
+    return cost_tracker.stats()
+
+
+# Ephemeral TURN credentials — STUN/TURN konfig'ini har user uchun
+# qisqa muddatli credential bilan qaytaradi. Hardcoded credentials xavfini
+# yo'q qiladi (eski Frontend ishlatib turgan ochiq creds bekor qilinadi).
+import hmac as _hmac
+import hashlib as _hashlib
+import base64 as _b64
+
+TURN_SHARED_SECRET = os.getenv("TURN_SHARED_SECRET", "")
+TURN_URLS = [
+    u.strip()
+    for u in os.getenv(
+        "TURN_URLS",
+        "stun:stun.l.google.com:19302,turn:global.relay.metered.ca:80,turn:global.relay.metered.ca:443?transport=tcp",
+    ).split(",")
+    if u.strip()
+]
+TURN_TTL_SEC = int(os.getenv("TURN_TTL_SEC", "1800"))  # 30 daqiqa
+
+
+@app.get("/webrtc/turn-config")
+def get_turn_config(current_user: database.User = Depends(get_current_user)):
+    """Ephemeral TURN credentials. Har 30 daqiqada bekor bo'ladi.
+    Frontend STUN+TURN URL'larni shu endpointdan oladi (hardcoded YO'Q).
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Auth required")
+
+    import time as _time
+    expiry = int(_time.time()) + TURN_TTL_SEC
+    username = f"{expiry}:{current_user.id}"
+
+    if TURN_SHARED_SECRET:
+        # RFC 5766-TURN-REST: HMAC-SHA1(username, secret)
+        digest = _hmac.new(
+            TURN_SHARED_SECRET.encode(), username.encode(), _hashlib.sha1
+        ).digest()
+        credential = _b64.b64encode(digest).decode()
+    else:
+        # Fallback: dev'da yoki TURN secret yo'q bo'lsa public STUN ishlatamiz
+        credential = ""
+
+    ice_servers = []
+    for url in TURN_URLS:
+        if url.startswith("stun:"):
+            ice_servers.append({"urls": url})
+        else:
+            ice_servers.append(
+                {
+                    "urls": url,
+                    "username": username,
+                    "credential": credential,
+                }
+            )
+    return {"iceServers": ice_servers, "ttl": TURN_TTL_SEC}
+
+
+@app.get("/auth/me", response_model=schemas.UserSchema)
+def get_me(current_user: database.User = Depends(get_current_user)):
+    """JWT token'ni server tarafda tekshiradi. Frontend `<AdminGuard>` shu
+    endpoint orqali real auth tasdiqlash imkoniyatini olishi mumkin (eski
+    `localStorage.admin_authenticated` o'rniga)."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return current_user
+
+
+@app.post("/admin/cost/reset")
+def admin_cost_reset(_: database.User = Depends(require_admin)):
+    """SuperAdmin uchun xarajat chegaralarini qayta o'rnatish (manual override)."""
+    from utils import cost_tracker
+    cost_tracker.reset()
+    return {"status": "reset"}
+
+
 # --- Candidates Endpoints ---
 
 @app.get("/candidates/stats/")
@@ -486,11 +1154,30 @@ def get_candidate_stats(db: Session = Depends(get_db), _: database.User = Depend
         "recent_activity": total # simplified
     }
 
+_timing_cache: Dict[int, tuple] = {}  # candidate_id -> (timestamp, result, answers_len)
+_timing_cache_lock = __import__("threading").Lock()
+_TIMING_CACHE_TTL = 5.0  # sek
+
+
 @app.get("/candidates/{candidate_id}/timing")
 def get_candidate_timing(candidate_id: int, db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
-    """Get processing time statistics for each turn of a candidate."""
+    """Get processing time statistics for each turn of a candidate.
+    #30 — natija 5 sekund cache qilinadi (frontend har 5-10 sek polling
+    qilganda CPU yuqotishni kamaytiradi). Cache invalidate: agar
+    `len(candidate.answers)` o'zgargan bo'lsa avtomatik freshly hisoblanadi.
+    """
+    import time as _t
     candidate = get_candidate_or_404(db, candidate_id)
     answers = candidate.answers or []
+    answers_len = len(answers)
+
+    # Cache lookup
+    with _timing_cache_lock:
+        cached = _timing_cache.get(candidate_id)
+    if cached:
+        cached_ts, cached_result, cached_len = cached
+        if cached_len == answers_len and (_t.time() - cached_ts) < _TIMING_CACHE_TTL:
+            return cached_result
     turns = []
     total_stt = 0
     total_prosody = 0
@@ -519,7 +1206,7 @@ def get_candidate_timing(candidate_id: int, db: Session = Depends(get_db), _: da
             "cost_usd": cost,
             "stt_provider": a.get("stt_provider", "whisper"),
         })
-    return {
+    result = {
         "candidate_id": candidate_id,
         "candidate_name": candidate.name,
         "turns": turns,
@@ -536,11 +1223,51 @@ def get_candidate_timing(candidate_id: int, db: Session = Depends(get_db), _: da
             "total_audio_sec": round(total_audio_sec, 1),
         },
     }
+    # #30 — cache yozish
+    with _timing_cache_lock:
+        _timing_cache[candidate_id] = (_t.time(), result, answers_len)
+        # Memory leak oldini olish — cache 1000+ ga yetsa eskini chiqaramiz
+        if len(_timing_cache) > 1000:
+            oldest = min(_timing_cache.items(), key=lambda kv: kv[1][0])[0]
+            _timing_cache.pop(oldest, None)
+    return result
 
 
 @app.get("/candidates/", response_model=List[schemas.CandidateSchema])
-def read_candidates(db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
-    candidates = db.query(Candidate).all()
+def read_candidates(
+    limit: int = 200,
+    offset: int = 0,
+    include_answers: bool = False,
+    db: Session = Depends(get_db),
+    _: database.User = Depends(require_admin),
+):
+    """Nomzodlar ro'yxati. Default `include_answers=false` — `answers` JSON
+    qaytarilmaydi (10x tezroq, har nomzod 5-50 KB tejash). Frontend list view'da
+    answers kerak emas — faqat detail page'da `GET /candidates/{id}` orqali olinadi.
+
+    Pagination: `limit=200` (max 500), `offset=0`."""
+    if limit < 1:
+        limit = 1
+    if limit > 500:
+        limit = 500
+    if offset < 0:
+        offset = 0
+
+    q = db.query(Candidate).order_by(Candidate.created_at.desc())
+    candidates = q.offset(offset).limit(limit).all()
+
+    if not include_answers:
+        # `answers` ni bo'sh ro'yxatga almashtirib, response payload'ni 90% kichraytiramiz.
+        # Pydantic ORM mode'da to'g'ri ishlashi uchun objektlarni nusxalaymiz.
+        for c in candidates:
+            # SQLAlchemy attribute'ni o'zgartirsak DB'ga sync bo'lib qoladi —
+            # session.expunge orqali ajratamiz, keyin `answers` ni `[]` qilamiz.
+            try:
+                db.expunge(c)
+                c.answers = []
+            except Exception:
+                pass
+
     return candidates
 
 @app.get("/candidates/{candidate_id}/visual", response_model=List[schemas.VisualRecordSchema])
@@ -597,10 +1324,9 @@ def read_latest_visual_frame(
 
     # image_url is stored as "/media/frames/<filename>"
     filename = Path(record.image_url).name
-    file_path = MEDIA_DIR / "frames" / filename
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Frame file not found")
-
+    # Defense-in-depth: DB dagi image_url buzilgan bo'lsa ham path traversal
+    # qo'shimcha validatsiya orqali to'sib qo'yiladi.
+    file_path = _safe_media_path(MEDIA_DIR / "frames", filename)
     encoded = base64.b64encode(file_path.read_bytes()).decode("utf-8")
     return {
         "candidate_id": candidate_id,
@@ -738,14 +1464,98 @@ def update_candidate(candidate_id: int, candidate: schemas.CandidateCreate, db: 
     db.refresh(db_candidate)
     return db_candidate
 
+def _delete_candidate_media(candidate_id: int, db: Session) -> dict:
+    """GDPR uchun: kandidat bilan bog'liq barcha media fayllarni diskdan o'chiradi.
+    DB yozuvlari CASCADE bilan o'chiriladi (visual_records), lekin
+    /backend/media/frames/ va /backend/media/audio/ dagi fayllar qo'lda
+    o'chirilishi kerak. Natija: o'chirilgan fayllar sonini qaytaradi."""
+    stats = {"frames_deleted": 0, "audio_deleted": 0, "errors": 0}
+
+    # 1. VisualRecord.image_url dan frame fayllarini topish
+    records = db.query(database.VisualRecord).filter_by(candidate_id=candidate_id).all()
+    for rec in records:
+        if rec.image_url:
+            fname = Path(rec.image_url).name
+            try:
+                fp = _safe_media_path(MEDIA_DIR / "frames", fname)
+                fp.unlink(missing_ok=True)
+                stats["frames_deleted"] += 1
+            except HTTPException:
+                # Noto'g'ri nom — e'tibor bermaymiz
+                pass
+            except Exception:
+                stats["errors"] += 1
+
+    # 2. Candidate.answers dagi audio_url larni topish
+    cand = db.query(database.Candidate).filter_by(id=candidate_id).first()
+    if cand and cand.answers:
+        for ans in (cand.answers or []):
+            audio_url = ans.get("audio_url") or ""
+            question_audio_url = ans.get("question_audio_url") or ""
+            for url in (audio_url, question_audio_url):
+                if not url:
+                    continue
+                fname = Path(url).name
+                try:
+                    fp = _safe_media_path(MEDIA_AUDIO_DIR, fname)
+                    fp.unlink(missing_ok=True)
+                    stats["audio_deleted"] += 1
+                except HTTPException:
+                    pass
+                except Exception:
+                    stats["errors"] += 1
+    return stats
+
+
 @app.delete("/candidates/{candidate_id}")
 def delete_candidate(candidate_id: int, db: Session = Depends(get_db), _: database.User = Depends(require_role(["SuperAdmin", "Recruiter"]))):
+    """Nomzodni to'liq o'chirish — GDPR "o'chirilish huquqi" (right to erasure).
+    DB yozuvlari (visual_records CASCADE orqali) + media fayllar (frames, audio)
+    birga o'chiriladi."""
     candidate = get_candidate_or_404(db, candidate_id)
-    # Delete related visual records
+    media_stats = _delete_candidate_media(candidate_id, db)
+    # Endi CASCADE bor — visual_records avtomatik o'chadi.
+    # Lekin SQLite da CASCADE ishlashi uchun PRAGMA kerak, shu sababli qo'lda ham.
     db.query(database.VisualRecord).filter(database.VisualRecord.candidate_id == candidate_id).delete()
     db.delete(candidate)
     db.commit()
-    return {"status": "deleted"}
+    return {"status": "deleted", "media": media_stats}
+
+
+@app.get("/candidates/{candidate_id}/gdpr-export")
+def gdpr_export_candidate(candidate_id: int, db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
+    """GDPR "portativlik huquqi" (right to portability) — kandidat ma'lumotlarini
+    JSON formatida eksport qiladi. Admin yoki kandidat o'zi so'rashi mumkin.
+    Media URL lar ham qaytariladi, lekin faylning o'zi emas (alohida endpoint orqali)."""
+    candidate = get_candidate_or_404(db, candidate_id)
+    visuals = db.query(database.VisualRecord).filter_by(candidate_id=candidate_id).all()
+
+    return {
+        "export_timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "candidate": {
+            "id": candidate.id,
+            "name": candidate.name,
+            "summary": candidate.summary,
+            "status": candidate.status,
+            "created_at": candidate.created_at.isoformat() if candidate.created_at else None,
+            "answers": candidate.answers,
+            "filters": candidate.filters,
+        },
+        "visual_records": [
+            {
+                "id": v.id,
+                "emotion": v.emotion,
+                "stress_level": v.stress_level,
+                "notes": v.notes,
+                "image_url": v.image_url,
+                "timestamp": v.timestamp.isoformat() if v.timestamp else None,
+            }
+            for v in visuals
+        ],
+        "data_controller": {
+            "note": "Ushbu ma'lumotlar GDPR art. 20 asosida portativ formatda taqdim etiladi",
+        },
+    }
 
 # --- Chat Endpoints ---
 
@@ -753,15 +1563,180 @@ def delete_candidate(candidate_id: int, db: Session = Depends(get_db), _: databa
 def get_chat_history(db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
     return db.query(ChatMessage).order_by(ChatMessage.id.asc()).all()
 
+def _celery_available() -> bool:
+    """Runtime tekshiruv — Celery worker ulanmagan bo'lsa sync fallback."""
+    if not _CELERY_IMPORTED:
+        return False
+    try:
+        return celery_enabled()
+    except Exception:
+        return False
+
+
+def _submit_chat_reply(user_message_id: int, prompt: str) -> Optional[str]:
+    """Celery ga AI chat javob taskini yuboradi yoki threading fallback ishlatadi.
+    Celery task ID ni qaytaradi (fallback holatda None)."""
+    if _celery_available():
+        try:
+            result = generate_ai_reply_task.delay(
+                user_message_id=user_message_id, prompt=prompt
+            )
+            return result.id
+        except Exception as exc:
+            logger.warning(f"Celery submit failed, falling back to thread: {exc}")
+
+    # Fallback — threading (eski xulq, faqat Celery mavjud bo'lmaganda)
+    import threading as _threading
+    import datetime as _dt
+
+    def _run():
+        try:
+            ai_text = logic.ask_mistral_raw(prompt)
+        except Exception:
+            ai_text = "AI сервер временно недоступен. Попробуйте позже."
+        try:
+            with SessionLocal() as ai_db:
+                ai_db.add(ChatMessage(
+                    role="assistant",
+                    content=ai_text,
+                    timestamp=_dt.datetime.now().isoformat(),
+                ))
+                ai_db.commit()
+        except Exception as e:
+            logger.error(f"AI chat reply DB write failed: {e}")
+
+    _threading.Thread(target=_run, daemon=True).start()
+    return None
+
+
+def _submit_transcribe(audio_path: str, audio_url: str,
+                       candidate_id: Optional[int] = None) -> str:
+    """STT taskini Celery ga yuboradi va task_id qaytaradi. Fallback threading bilan."""
+    if _celery_available():
+        try:
+            result = transcribe_audio_task.delay(
+                audio_path=audio_path, audio_url=audio_url, candidate_id=candidate_id
+            )
+            return result.id
+        except Exception as exc:
+            logger.warning(f"Celery STT submit failed, fallback: {exc}")
+
+    # Fallback threading
+    import threading as _threading
+    task_id = str(uuid.uuid4())
+
+    def _run():
+        try:
+            text, elapsed_ms = logic.transcribe_audio(audio_path)
+            with SessionLocal() as tdb:
+                tdb.add(database.GlobalSetting(
+                    key=f"stt_result_{task_id}",
+                    value={"text": text, "elapsed_ms": elapsed_ms,
+                           "audio_url": audio_url, "status": "done"},
+                ))
+                tdb.commit()
+            _broadcast_sync({"type": "STT_RESULT", "task_id": task_id,
+                             "text": text, "audio_url": audio_url,
+                             "elapsed_ms": elapsed_ms})
+        except Exception as e:
+            logger.warning(f"Background transcribe failed: {e}")
+            with SessionLocal() as tdb:
+                tdb.add(database.GlobalSetting(
+                    key=f"stt_result_{task_id}",
+                    value={"text": "", "error": str(e),
+                           "audio_url": audio_url, "status": "error"},
+                ))
+                tdb.commit()
+
+    _threading.Thread(target=_run, daemon=True).start()
+    return task_id
+
+
+def _submit_process_turn(candidate_id: int, turn_uid: str, question: str,
+                          audio_path: str, audio_url: str,
+                          parsed_face_stats: Optional[dict]) -> Optional[str]:
+    """Process-turn pipeline ni Celery ga yuboradi. Fallback threading bilan."""
+    if _celery_available():
+        try:
+            result = process_turn_full_task.delay(
+                candidate_id=candidate_id,
+                turn_uid=turn_uid,
+                question=question,
+                audio_path=audio_path,
+                audio_url=audio_url,
+                parsed_face_stats=parsed_face_stats,
+            )
+            return result.id
+        except Exception as exc:
+            logger.warning(f"Celery process-turn submit failed, fallback: {exc}")
+
+    # Fallback — threading orqali asl logika chaqiriladi
+    import threading as _threading
+    from tasks.process_turn_tasks import process_turn_full_task as _task
+
+    def _run():
+        try:
+            # Celery task function ni to'g'ridan-to'g'ri chaqiramiz (bind=True chunki
+            # self parametri mock qilinadi — oddiy funksiya sifatida ishlashi uchun
+            # Celery app nomidan task.apply() ishlatamiz).
+            _task.apply(
+                kwargs={
+                    "candidate_id": candidate_id,
+                    "turn_uid": turn_uid,
+                    "question": question,
+                    "audio_path": audio_path,
+                    "audio_url": audio_url,
+                    "parsed_face_stats": parsed_face_stats,
+                }
+            )
+        except Exception as e:
+            logger.error(f"Fallback process-turn failed: {e}")
+
+    _threading.Thread(target=_run, daemon=True).start()
+    return None
+
+
+def _build_psychologist_prompt(db: Session, user_message: str) -> str:
+    """Psixolog AI javobi uchun prompt quradi. Celery task bilan tashqarida
+    chaqirilib, tayyor prompt satrini taskka uzatamiz (DB access worker da
+    takrorlanmaydi)."""
+    recent = db.query(ChatMessage).order_by(ChatMessage.id.desc()).limit(10).all()
+    context = "\n".join([f"{m.role}: {m.content}" for m in reversed(recent)])
+    insights_setting = db.query(GlobalSetting).filter(GlobalSetting.key == "psychologist_insights").first()
+    filters_setting = db.query(GlobalSetting).filter(GlobalSetting.key == "global_filters").first()
+    saved_insights = insights_setting.value if insights_setting and isinstance(insights_setting.value, list) else []
+    active_filters = filters_setting.value if filters_setting and isinstance(filters_setting.value, list) else []
+    filters_block = (
+        "Активные требования:\n- " + "\n- ".join(active_filters[:8])
+        if active_filters
+        else "Активные требования пока не заданы."
+    )
+    insights_block = (
+        "Сохранённые инсайты:\n- " + "\n- ".join(saved_insights[:8])
+        if saved_insights
+        else "Сохранённых инсайтов пока нет."
+    )
+    return (
+        "Ты внутренний AI-психолог платформы интервью.\n"
+        "Отвечай профессионально, кратко и практично.\n"
+        "Делай акцент на методологии оценки кандидата, поведенческих сигналах, рисках и улучшении процесса интервью.\n\n"
+        f"{filters_block}\n\n"
+        f"{insights_block}\n\n"
+        f"Недавний контекст диалога:\n{context}\n\n"
+        f"Запрос психолога:\n{user_message}"
+    )
+
+
 @app.post("/chat/")
+@limiter.limit(RL_CHAT)
 def add_chat_message(
+    request: Request,
     msg: schemas.ChatMessageCreate,
     generate_reply: bool = False,
     db: Session = Depends(get_db),
     _: database.User = Depends(require_admin),
 ):
     import datetime as dt
-    import threading
 
     # Save user message
     db_msg = ChatMessage(
@@ -777,58 +1752,8 @@ def add_chat_message(
 
     # Generate assistant reply only when the caller explicitly asks for it.
     if msg.role == "user" and generate_reply:
-        def generate_ai_reply():
-            ai_db = SessionLocal()
-            try:
-                # Build context from recent messages
-                recent = ai_db.query(ChatMessage).order_by(ChatMessage.id.desc()).limit(10).all()
-                context = "\n".join([f"{m.role}: {m.content}" for m in reversed(recent)])
-                insights_setting = ai_db.query(GlobalSetting).filter(GlobalSetting.key == "psychologist_insights").first()
-                filters_setting = ai_db.query(GlobalSetting).filter(GlobalSetting.key == "global_filters").first()
-
-                saved_insights = insights_setting.value if insights_setting and isinstance(insights_setting.value, list) else []
-                active_filters = filters_setting.value if filters_setting and isinstance(filters_setting.value, list) else []
-
-                filters_block = (
-                    "Активные требования:\n- " + "\n- ".join(active_filters[:8])
-                    if active_filters
-                    else "Активные требования пока не заданы."
-                )
-                insights_block = (
-                    "Сохранённые инсайты:\n- " + "\n- ".join(saved_insights[:8])
-                    if saved_insights
-                    else "Сохранённых инсайтов пока нет."
-                )
-                prompt = (
-                    "Ты внутренний AI-психолог платформы интервью.\n"
-                    "Отвечай профессионально, кратко и практично.\n"
-                    "Делай акцент на методологии оценки кандидата, поведенческих сигналах, рисках и улучшении процесса интервью.\n\n"
-                    f"{filters_block}\n\n"
-                    f"{insights_block}\n\n"
-                    f"Недавний контекст диалога:\n{context}\n\n"
-                    f"Запрос психолога:\n{msg.content}"
-                )
-
-                # Get AI response via the configured provider.
-                try:
-                    ai_text = logic.ask_mistral_raw(prompt)
-                except Exception:
-                    ai_text = "AI сервер временно недоступен. Попробуйте позже."
-
-                ai_msg = ChatMessage(
-                    role="assistant",
-                    content=ai_text,
-                    timestamp=dt.datetime.now().isoformat()
-                )
-                ai_db.add(ai_msg)
-                ai_db.commit()
-            except Exception as e:
-                logger.error(f"AI chat reply failed: {e}")
-            finally:
-                ai_db.close()
-
-        thread = threading.Thread(target=generate_ai_reply, daemon=True)
-        thread.start()
+        prompt = _build_psychologist_prompt(db, msg.content)
+        _submit_chat_reply(user_message_id=db_msg.id, prompt=prompt)
 
     return user_msg
 
@@ -886,85 +1811,69 @@ def delete_setting(key: str, db: Session = Depends(get_db), _: database.User = D
 # --- Logic Endpoints (AI) ---
 
 @app.post("/logic/upload-audio/")
-def upload_audio_api(file: UploadFile = File(...), _: database.User = Depends(require_admin)):
+@limiter.limit(RL_UPLOAD_AUDIO)
+def upload_audio_api(request: Request, file: UploadFile = File(...), _: database.User = Depends(require_admin)):
     """Upload audio file and return URL immediately. No STT processing."""
-    ext = os.path.splitext(file.filename or "")[1]
-    if not ext:
-        if file.content_type == "audio/webm":
-            ext = ".webm"
-        elif file.content_type == "audio/ogg":
-            ext = ".ogg"
-        else:
-            ext = ".wav"
+    ext = _validate_upload_mime(
+        file, ALLOWED_AUDIO_MIMES, ALLOWED_AUDIO_EXTS, label="audio", default_ext=".wav"
+    )
     audio_filename = f"{secrets.token_hex(16)}{ext}"
     save_path = MEDIA_AUDIO_DIR / audio_filename
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(save_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    _stream_upload_to_path(file, save_path, MAX_AUDIO_UPLOAD_BYTES, label="audio")
     return {"audio_url": f"/media/audio/{audio_filename}"}
 
 
-@app.post("/logic/transcribe/")
-def transcribe_audio_api(file: UploadFile = File(...), save: bool = False, _: database.User = Depends(require_admin)):
-    ext = os.path.splitext(file.filename or "")[1]
-    if not ext:
-        # Fallback by content-type
-        if file.content_type == "audio/webm":
-            ext = ".webm"
-        elif file.content_type == "audio/ogg":
-            ext = ".ogg"
-        else:
-            ext = ".wav"
+_STT_EXEC_TIMEOUT = int(os.getenv("CELERY_TASK_STT_TIMEOUT", "120"))
+_LLM_EXEC_TIMEOUT = int(os.getenv("CELERY_TASK_RAG_TIMEOUT", "60"))
 
-    # Save audio permanently if requested, otherwise use temp file
+
+@app.post("/logic/transcribe/")
+@limiter.limit(RL_TRANSCRIBE)
+async def transcribe_audio_api(request: Request, file: UploadFile = File(...), save: bool = False, _: database.User = Depends(require_admin)):
+    """Audio fayl transkripsiya. `save=true` bo'lsa Celery task (immediate return),
+    `save=false` bo'lsa sync — lekin **bounded STT pool** (max 4 parallel) orqali.
+    Pool to'lsa 503, exec timeoutda 504."""
+    ext = _validate_upload_mime(
+        file, ALLOWED_AUDIO_MIMES, ALLOWED_AUDIO_EXTS, label="audio", default_ext=".wav"
+    )
+
     audio_url = None
     if save:
         audio_filename = f"{secrets.token_hex(16)}{ext}"
         save_path = MEDIA_AUDIO_DIR / audio_filename
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(save_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        _stream_upload_to_path(file, save_path, MAX_AUDIO_UPLOAD_BYTES, label="audio")
         tmp_path = str(save_path)
         audio_url = f"/media/audio/{audio_filename}"
     else:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            shutil.copyfileobj(file.file, tmp)
-            tmp_path = tmp.name
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+        tmp.close()
+        tmp_dest = Path(tmp.name)
+        try:
+            _stream_upload_to_path(file, tmp_dest, MAX_AUDIO_UPLOAD_BYTES, label="audio")
+        except HTTPException:
+            raise
+        tmp_path = str(tmp_dest)
 
-    # If save=true, return immediately and process in background
-    # Frontend will get audio_url now, text via polling later
+    # save=true — Celery task queue (immediate return)
     if save and audio_url:
-        task_id = str(uuid.uuid4())
-
-        import threading
-        def background_transcribe():
-            try:
-                text, elapsed_ms = logic.transcribe_audio(tmp_path)
-                # Store result in global settings for polling
-                with SessionLocal() as tdb:
-                    setting = database.GlobalSetting(key=f"stt_result_{task_id}", value={"text": text, "elapsed_ms": elapsed_ms, "audio_url": audio_url, "status": "done"})
-                    tdb.add(setting)
-                    tdb.commit()
-                _broadcast_sync({"type": "STT_RESULT", "task_id": task_id, "text": text, "audio_url": audio_url, "elapsed_ms": elapsed_ms})
-            except Exception as e:
-                logger.warning(f"Background transcribe failed: {e}")
-                with SessionLocal() as tdb:
-                    setting = database.GlobalSetting(key=f"stt_result_{task_id}", value={"text": "", "error": str(e), "audio_url": audio_url, "status": "error"})
-                    tdb.add(setting)
-                    tdb.commit()
-
-        thread = threading.Thread(target=background_transcribe, daemon=True)
-        thread.start()
-
+        task_id = _submit_transcribe(audio_path=tmp_path, audio_url=audio_url)
         return {"text": "", "elapsed_ms": 0, "audio_url": audio_url, "task_id": task_id, "status": "processing"}
 
-    # Sync mode (save=false) — wait for result
+    # save=false — sync, lekin bounded STT pool orqali
     try:
-        text, elapsed_ms = logic.transcribe_audio(tmp_path)
+        text, elapsed_ms = await run_bounded(
+            stt_executor,
+            logic.transcribe_audio, tmp_path,
+            exec_timeout_sec=_STT_EXEC_TIMEOUT,
+        )
         result = {"text": text, "elapsed_ms": elapsed_ms}
         if audio_url:
             result["audio_url"] = audio_url
         return result
+    except QueueFull as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail=f"STT {_STT_EXEC_TIMEOUT}s ichida tugamadi")
     except logic.TranscriptionError as exc:
         if audio_url:
             raise HTTPException(status_code=400, detail={"message": str(exc), "audio_url": audio_url})
@@ -988,28 +1897,56 @@ def get_stt_result(task_id: str, db: Session = Depends(get_db)):
     return result
 
 @app.post("/logic/analyze/")
-def analyze_answer_api(question: str, answer: str, _: database.User = Depends(require_admin)):
+async def analyze_answer_api(question: str, answer: str, _: database.User = Depends(require_admin)):
+    """Mistral RAG analiz — bounded LLM pool orqali."""
     try:
-        analysis = logic.analyze_answer(question, answer)
+        analysis = await run_bounded(
+            llm_executor,
+            logic.analyze_answer, question, answer,
+            exec_timeout_sec=_LLM_EXEC_TIMEOUT,
+        )
+    except QueueFull as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail=f"LLM {_LLM_EXEC_TIMEOUT}s ichida javob bermadi")
     except logic.AIServiceError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"analysis": analysis}
 
+
 @app.post("/logic/ask/")
-def ask_mistral_api(prompt: str, _: database.User = Depends(require_admin)):
+async def ask_mistral_api(prompt: str, _: database.User = Depends(require_admin)):
+    """To'g'ridan Mistral chaqiruvi — bounded LLM pool orqali."""
     try:
-        response = logic.ask_mistral_raw(prompt)
+        response = await run_bounded(
+            llm_executor,
+            logic.ask_mistral_raw, prompt,
+            exec_timeout_sec=_LLM_EXEC_TIMEOUT,
+        )
+    except QueueFull as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail=f"LLM {_LLM_EXEC_TIMEOUT}s ichida javob bermadi")
     except logic.AIServiceError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"response": response}
 
 
 @app.post("/logic/summary/")
-def generate_summary_api(candidate_id: int, db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
+async def generate_summary_api(candidate_id: int, db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
+    """Intervyu xulosasi — bounded LLM pool orqali."""
     candidate = get_candidate_or_404(db, candidate_id)
 
     try:
-        summary = logic.build_interview_summary(candidate.answers)
+        summary = await run_bounded(
+            llm_executor,
+            logic.build_interview_summary, candidate.answers,
+            exec_timeout_sec=_LLM_EXEC_TIMEOUT,
+        )
+    except QueueFull as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail=f"Summary {_LLM_EXEC_TIMEOUT}s ichida tugamadi")
     except logic.AIServiceError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     candidate.summary = summary
@@ -1047,7 +1984,9 @@ def patch_answer_field(
 
 
 @app.post("/logic/process-turn/")
+@limiter.limit(RL_PROCESS_TURN)
 def process_turn_api(
+    request: Request,
     candidate_id: int = Form(...),
     question: str = Form(...),
     file: UploadFile = File(...),
@@ -1064,31 +2003,45 @@ def process_turn_api(
         logger.error(f"process-turn candidate lookup failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Create permanent audio storage path
-    ext = os.path.splitext(file.filename or "")[1]
-    if not ext:
-        if file.content_type == "audio/webm":
-            ext = ".webm"
-        elif file.content_type == "audio/ogg":
-            ext = ".ogg"
-        else:
-            ext = ".wav"
+    # Create permanent audio storage path (MIME + hajm tekshiruvi bilan)
+    ext = _validate_upload_mime(
+        file, ALLOWED_AUDIO_MIMES, ALLOWED_AUDIO_EXTS, label="audio", default_ext=".wav"
+    )
 
     audio_filename = f"{secrets.token_hex(16)}{ext}"
     save_path = MEDIA_AUDIO_DIR / audio_filename
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(save_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    _stream_upload_to_path(file, save_path, MAX_AUDIO_UPLOAD_BYTES, label="audio")
 
     # INSTANT RESPONSE — save audio, return immediately, process everything in background
     audio_path = str(save_path)
     turn_uid = str(uuid.uuid4())
-    # Parse face stats from JSON
+    # Parse + validate face stats from JSON.
+    # Schema: {gaze_focused_pct, gaze_away_pct, mouth_open_pct, eyes_closed_pct,
+    #          face_not_found_pct} — har biri 0-100 oralig'ida float.
     parsed_face_stats = None
     if face_stats:
         try:
-            parsed_face_stats = json.loads(face_stats)
+            raw = json.loads(face_stats)
+            if isinstance(raw, dict):
+                allowed_keys = {
+                    "gaze_focused_pct", "gaze_away_pct", "mouth_open_pct",
+                    "eyes_closed_pct", "face_not_found_pct", "duration_sec", "total",
+                }
+                clean: Dict[str, float] = {}
+                for k, v in raw.items():
+                    if k not in allowed_keys:
+                        continue
+                    try:
+                        f = float(v)
+                    except (TypeError, ValueError):
+                        continue
+                    # NaN/Inf'ni tashlaymiz — LLM prompt'iga "NaN%" tushib qolmasligi uchun
+                    if f != f or f in (float("inf"), float("-inf")):
+                        continue
+                    if k.endswith("_pct"):
+                        f = max(0.0, min(100.0, f))
+                    clean[k] = round(f, 1)
+                parsed_face_stats = clean if clean else None
         except Exception:
             pass
 
@@ -1105,168 +2058,47 @@ def process_turn_api(
         "face_stats": parsed_face_stats,
         "stt_ms": 0,
     }
-    answers = list(candidate.answers or [])
-    answers.append(basic_result.copy())
-    candidate.answers = answers
-    flag_modified(candidate, "answers")
+    # Row-level lock — concurrent process_turn so'rovlari `answers` JSON ni
+    # bir-birining ustidan yozib qo'ymasligi uchun. PostgreSQL'da SELECT FOR UPDATE,
+    # SQLite ignore qiladi (lekin SQLite'da yagona writer bor).
     try:
+        cand_locked = (
+            db.query(database.Candidate)
+            .filter_by(id=candidate.id)
+            .with_for_update()
+            .first()
+        )
+        if not cand_locked:
+            raise HTTPException(status_code=404, detail="Кандидат не найден (concurrent delete?)")
+        answers = list(cand_locked.answers or [])
+        answers.append(basic_result.copy())
+        cand_locked.answers = answers
+        flag_modified(cand_locked, "answers")
         db.commit()
+        candidate = cand_locked  # rest of function uses `candidate`
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Не удалось сохранить: {e}")
 
-    # ALL PROCESSING IN BACKGROUND — Whisper + prosody + AI
-    import threading
-
-    def run_full_background_processing():
-        analysis_db = SessionLocal()
-        try:
-            import time as _time
-
-            # Step 1: Whisper STT
-            transcript = ""
-            stt_ms = 0
-            t0 = _time.time()
-            try:
-                transcript, stt_ms = logic.transcribe_audio(audio_path)
-            except Exception as e:
-                logger.warning(f"Whisper STT failed: {e}")
-                transcript = "(Речь не распознана)"
-            stt_wall_ms = int((_time.time() - t0) * 1000)
-
-            # Step 1b: Smooth transcript via LLM (Mistral → Ollama).
-            # Preserve the raw STT output for audit and fall back to it on
-            # any smoothing failure.
-            transcript_raw = transcript
-            smooth_ms = 0
-            t0 = _time.time()
-            try:
-                transcript = logic.smooth_transcript(transcript_raw) or transcript_raw
-            except Exception as e:
-                logger.warning(f"Transcript smoothing failed: {e}")
-                transcript = transcript_raw
-            smooth_ms = int((_time.time() - t0) * 1000)
-
-            # Step 2: Voice prosody (librosa)
-            voice_raw = ""
-            t0 = _time.time()
-            try:
-                voice_raw = logic.run_voice_profiler(audio_path)
-            except Exception as e:
-                logger.warning(f"Voice profiler failed: {e}")
-            prosody_ms = int((_time.time() - t0) * 1000)
-
-            # Step 3: AI analysis (Mistral + RAG + face stats + emotion/stress aggregates)
-            face_context = ""
-            if parsed_face_stats:
-                face_context = f"\nДАННЫЕ ВИДЕОАНАЛИЗА ЛИЦА: Взгляд сфокусирован {parsed_face_stats.get('gaze_focused_pct', 0)}%, отведён {parsed_face_stats.get('gaze_away_pct', 0)}%, глаза закрыты {parsed_face_stats.get('eyes_closed_pct', 0)}%."
-
-            # Pull VisualRecord samples from the window the candidate was answering
-            # and summarize dominant emotion / stress for the AI prompt.
-            try:
-                from collections import Counter
-                window_sec = 120  # covers typical answer durations with margin
-                since = datetime.datetime.utcnow() - datetime.timedelta(seconds=window_sec)
-                recent_visuals = (
-                    analysis_db.query(database.VisualRecord)
-                    .filter(
-                        database.VisualRecord.candidate_id == candidate_id,
-                        database.VisualRecord.timestamp >= since,
-                    )
-                    .all()
-                )
-                if recent_visuals:
-                    emotions = [v.emotion for v in recent_visuals if v.emotion]
-                    stresses = [v.stress_level for v in recent_visuals if v.stress_level]
-                    dominant_emotion = Counter(emotions).most_common(1)[0][0] if emotions else "—"
-                    dominant_stress = Counter(stresses).most_common(1)[0][0] if stresses else "—"
-                    face_context += (
-                        f"\nПОВЕДЕНИЕ И ЭМОЦИИ (по {len(recent_visuals)} видеокадрам за этот ответ): "
-                        f"доминирующая эмоция — {dominant_emotion}, уровень стресса — {dominant_stress}. "
-                        f"Учитывайте эти сигналы при оценке уверенности, искренности и эмоционального состояния кандидата."
-                    )
-            except Exception as exc:
-                logger.warning(f"visual aggregate failed: {exc}")
-
-            # Merge global + per-candidate HR filters into the analysis context.
-            try:
-                global_setting = analysis_db.query(database.GlobalSetting).filter_by(key="global_filters").first()
-                global_filters = global_setting.value if global_setting and isinstance(global_setting.value, list) else []
-                cand_for_filters = analysis_db.query(database.Candidate).filter_by(id=candidate_id).first()
-                candidate_filters = list(cand_for_filters.filters or []) if cand_for_filters else []
-                merged = [*global_filters, *candidate_filters]
-                if merged:
-                    face_context += "\nТРЕБОВАНИЯ HR (оценивайте соответствие):\n- " + "\n- ".join(merged[:16])
-            except Exception as exc:
-                logger.warning(f"filter merge failed: {exc}")
-
-            rag_ai = ""
-            t0 = _time.time()
-            try:
-                rag_ai = logic.analyze_answer(question, transcript, context=face_context)
-            except Exception:
-                rag_ai = "AI анализ недоступен"
-            ai_ms = int((_time.time() - t0) * 1000)
-
-            # Update the answer with all results
-            cand = analysis_db.query(database.Candidate).with_for_update().filter_by(id=candidate_id).first()
-            if cand:
-                ans = list(cand.answers or [])
-                for i, item in enumerate(ans):
-                    if item.get("turn_uid") == turn_uid:
-                        ans[i]["answer"] = transcript
-                        ans[i]["candidate_raw"] = transcript_raw
-                        ans[i]["ai"] = rag_ai
-                        ans[i]["voice_raw"] = voice_raw
-                        ans[i]["stt_ms"] = stt_ms
-                        ans[i]["stt_wall_ms"] = stt_wall_ms
-                        ans[i]["smooth_ms"] = smooth_ms
-                        ans[i]["prosody_ms"] = prosody_ms
-                        ans[i]["ai_ms"] = ai_ms
-                        ans[i]["total_ms"] = stt_wall_ms + smooth_ms + prosody_ms + ai_ms
-                        # Cost tracking
-                        audio_duration_sec = 0
-                        try:
-                            import subprocess as _sp
-                            probe = _sp.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", audio_path], capture_output=True, text=True, timeout=5)
-                            audio_duration_sec = float(probe.stdout.strip() or 0)
-                        except Exception:
-                            audio_duration_sec = (stt_ms / 1000) if stt_ms > 0 else 15  # estimate
-                        audio_min = audio_duration_sec / 60
-                        deepgram_cost = audio_min * 0.0043 if logic.DEEPGRAM_API_KEY else 0
-                        # Mistral AI: ~0.2$ per 1M input tokens, ~0.6$ per 1M output tokens
-                        # Estimate: ~2000 tokens per turn = ~$0.0004
-                        mistral_cost = 0.0004
-                        # Mistral embed for RAG: ~$0.0001 per call
-                        embed_cost = 0.0001
-                        turn_cost = round(deepgram_cost + mistral_cost + embed_cost, 6)
-                        ans[i]["cost_usd"] = turn_cost
-                        ans[i]["audio_duration_sec"] = round(audio_duration_sec, 1)
-                        ans[i]["stt_provider"] = "deepgram" if logic.DEEPGRAM_API_KEY else "whisper"
-                        break
-                cand.answers = ans
-                flag_modified(cand, "answers")
-                analysis_db.commit()
-
-            _broadcast_sync({"type": "TURN_RESULT", "candidate_id": candidate_id, "question": question, "answer": transcript, "ai": rag_ai, "voice_raw": voice_raw, "audio_url": basic_result.get("audio_url", ""), "turn_uid": turn_uid, "stt_ms": stt_ms, "stt_wall_ms": stt_wall_ms, "prosody_ms": prosody_ms, "ai_ms": ai_ms, "total_ms": stt_wall_ms + prosody_ms + ai_ms})
-
-            send_telegram_notification(f"📝 <b>Ответ проанализирован</b>\n❓ {question}\n💬 {transcript[:100]}...\n🧠 {rag_ai[:150]}")
-        except Exception as e:
-            logger.error(f"Background analysis failed: {e}")
-            try:
-                analysis_db.rollback()
-            except Exception:
-                pass
-        finally:
-            analysis_db.close()
-
+    # ALL PROCESSING IN BACKGROUND — Whisper + prosody + AI (Celery task queue)
     try:
-        thread = threading.Thread(target=run_full_background_processing, daemon=True)
-        thread.start()
+        task_id = _submit_process_turn(
+            candidate_id=candidate_id,
+            turn_uid=turn_uid,
+            question=question,
+            audio_path=audio_path,
+            audio_url=f"/media/audio/{audio_filename}",
+            parsed_face_stats=parsed_face_stats,
+        )
+        if task_id:
+            basic_result["job_id"] = task_id
     except Exception as e:
-        logger.error(f"Failed to start AI thread: {e}")
+        logger.error(f"Failed to submit process-turn job: {e}")
 
     return basic_result
+
 
 # Helper to validate password strength
 def validate_password_strength(password: str):
@@ -1291,11 +2123,24 @@ def _prune_old_frames(frames_dir: Path, max_age_sec: int) -> None:
 
 
 @app.post("/logic/analyze-frame/")
-def analyze_frame_api(candidate_id: int, file: UploadFile = File(...)):
+@limiter.limit(RL_ANALYZE_FRAME)
+async def analyze_frame_api(request: Request, candidate_id: int, file: UploadFile = File(...)):
+    """#27 — endi async + bounded `frame_executor` (max 4 paralel Haar cascade).
+    20+ paralel kandidat bo'lsa thread pool exhaustion bo'lmaydi."""
     from utils.face_analyzer import analyze_frame
 
-    image_bytes = file.file.read()
-    result = analyze_frame(image_bytes)
+    _validate_upload_mime(
+        file, ALLOWED_IMAGE_MIMES, ALLOWED_IMAGE_EXTS, label="rasm", default_ext=".jpg"
+    )
+    image_bytes = _read_upload_bytes(file, MAX_IMAGE_UPLOAD_BYTES, label="rasm")
+    try:
+        result = await run_bounded(
+            frame_executor, analyze_frame, image_bytes, exec_timeout_sec=10
+        )
+    except QueueFull:
+        raise HTTPException(status_code=503, detail="Frame analysis pool busy")
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Frame analysis timeout")
 
     # Persist frame + visual record so admins can see the live feed and so
     # the answer analyzer can pull emotion/stress signals from this window.
@@ -1319,16 +2164,18 @@ def analyze_frame_api(candidate_id: int, file: UploadFile = File(...)):
                 frame_db.add(record)
                 frame_db.commit()
 
-            # Probabilistic prune — ~1% of writes clean up frames older than 2h.
-            if secrets.randbelow(100) == 0:
-                _prune_old_frames(frames_dir, max_age_sec=2 * 3600)
+            # Eski 1% probabilistic cleanup endi periodic background task'ga
+            # ko'chirildi — har 5 daqiqada deterministic ishlaydi (frame disk
+            # to'ldirish xavfini yo'q qiladi). _frames_cleanup_watcher ga qarang.
         except Exception as e:
             logger.warning(f"Visual record save failed: {e}")
 
     return result
 
 @app.post("/logic/face-ai-analysis/")
+@limiter.limit(RL_FACE_AI)
 def face_ai_analysis(
+    request: Request,
     gaze_focused_pct: float = Form(0),
     gaze_away_pct: float = Form(0),
     mouth_open_pct: float = Form(0),
@@ -1361,6 +2208,13 @@ def face_ai_analysis(
 
 @app.websocket("/ws/live-analysis/")
 async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = None):
+    # #16 — token cookie'dan ham olinadi (HttpOnly auth)
+    token = _ws_extract_token(websocket, token)
+    # Rate limit — har user/IP uchun max 5 connection / 60 sek
+    rl_key = _ws_rate_key_from_token(token, websocket.client.host if websocket.client else "unknown")
+    if not _ws_rate_limit_check(rl_key):
+        await websocket.close(code=1008, reason="Rate limit exceeded")
+        return
     # Verify token before accepting connection
     if not token:
         await websocket.close(code=4001) # Unauthorized
@@ -1377,16 +2231,35 @@ async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = None):
         return
 
     await manager.connect(websocket)
+    # #25 — per-message rate limit (anti-flood). 30 msg/10sek max.
+    import time as _t
+    msg_timestamps: List[float] = []
+    MAX_MSG = 30
+    WINDOW = 10.0
     try:
         while True:
-            # Keep-alive loop
             await websocket.receive_text()
+            now = _t.time()
+            msg_timestamps[:] = [t for t in msg_timestamps if now - t < WINDOW]
+            if len(msg_timestamps) >= MAX_MSG:
+                await websocket.send_json(
+                    {"type": "error", "message": "Слишком много сообщений в секунду"}
+                )
+                await websocket.close(code=1008)
+                break
+            msg_timestamps.append(now)
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
 @app.websocket("/ws/notifications")
 async def notifications_websocket(websocket: WebSocket, token: Optional[str] = None):
-    """Per-user notification stream. JWT is passed as ``?token=...`` query param."""
+    """Per-user notification stream. JWT cookie yoki ``?token=...`` query param."""
+    token = _ws_extract_token(websocket, token)  # #16
+    # Rate limit
+    rl_key = _ws_rate_key_from_token(token, websocket.client.host if websocket.client else "unknown")
+    if not _ws_rate_limit_check(rl_key):
+        await websocket.close(code=1008, reason="Rate limit exceeded")
+        return
     if not token:
         await websocket.close(code=4001)
         return
@@ -1427,6 +2300,12 @@ async def notifications_websocket(websocket: WebSocket, token: Optional[str] = N
 @app.websocket("/ws/webrtc/{candidate_id}")
 async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optional[str] = None):
     logger.info(f"[WebRTC] New connection request for candidate_id={candidate_id}, token_present={bool(token)}")
+    token = _ws_extract_token(websocket, token)  # #16 — cookie support
+    # Rate limit
+    rl_key = _ws_rate_key_from_token(token, websocket.client.host if websocket.client else "unknown")
+    if not _ws_rate_limit_check(rl_key):
+        await websocket.close(code=1008, reason="Rate limit exceeded")
+        return
     if not token:
         logger.warning(f"[WebRTC] Connection rejected: No token provided for candidate_id={candidate_id}")
         await websocket.close(code=4001)
@@ -1446,6 +2325,7 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
                 await websocket.close(code=4003)
                 return
             actor_type = "candidate"
+            actor_email = None
         else:
             # Admin JWT uses sub=email and role=user.role
             email = sub
@@ -1466,7 +2346,8 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
                     await websocket.close(code=4003)
                     return
             actor_type = "admin"
-        
+            actor_email = email
+
         logger.info(f"[WebRTC] Connection authorized: actor_type={actor_type}, candidate_id={candidate_id}")
 
     except JWTError as e:
@@ -1482,13 +2363,24 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
     room = _get_room(int(candidate_id))
     
     if actor_type == "admin":
+        # Admin takeover qarshi himoya: agar boshqa admin allaqachon ulangan bo'lsa
+        # va u BOSHQA email bo'lsa — yangi ulanishni rad etamiz (silent takeover'ni
+        # oldini oladi). Bir xil admin reconnect qilsa — replace OK (yangi browser tab).
+        if room.admin and room.admin_email and room.admin_email != actor_email:
+            logger.warning(
+                f"[WebRTC] Room {candidate_id}: takeover blocked — "
+                f"existing admin '{room.admin_email}' vs new '{actor_email}'"
+            )
+            await websocket.close(code=4003, reason="Another admin is already in this room")
+            return
         if room.admin:
-            logger.info(f"[WebRTC] Room {candidate_id}: Replacing existing admin connection")
+            logger.info(f"[WebRTC] Room {candidate_id}: Replacing existing admin connection (same admin)")
             try:
                 await room.admin.close()
             except Exception:
                 pass
         room.admin = websocket
+        room.admin_email = actor_email
     else:
         if room.candidate:
             logger.info(f"[WebRTC] Room {candidate_id}: Replacing existing candidate connection")
@@ -1556,7 +2448,13 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
 
 @app.post("/auth/login")
 @limiter.limit("5/minute")
-def login(request: Request, email: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
+def login(
+    request: Request,
+    response: Response,
+    email: str = Form(...),
+    password: str = Form(...),
+    db: Session = Depends(get_db),
+):
     user = db.query(database.User).filter(database.User.email == email).first()
     if not user or not verify_password(password, user.password):
         raise HTTPException(status_code=401, detail="Неверный email или пароль")
@@ -1571,13 +2469,47 @@ def login(request: Request, email: str = Form(...), password: str = Form(...), d
         data={"sub": user.email, "role": user.role}, expires_delta=access_token_expires
     )
 
+    # JWT'ni HttpOnly cookie sifatida ham yuboramiz — XSS hujum tokenni
+    # localStorage'dan ololmaydi. Frontend asta-sekin Bearer header'dan
+    # cookie'ga ko'chadi (backward compat: ikkalasi ham ishlaydi).
+    is_prod = os.getenv("ENVIRONMENT", "").lower() in {"production", "prod", "staging", "live"}
+    response.set_cookie(
+        key="admin_token",
+        value=access_token,
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        httponly=True,
+        secure=is_prod,           # HTTPS-only in prod
+        samesite="lax",
+    )
+
     return {
         "access_token": access_token,
         "token_type": "bearer",
         "email": user.email,
         "name": user.name,
-        "role": user.role
+        "role": user.role,
     }
+
+
+@app.post("/auth/logout")
+def logout(
+    response: Response,
+    token: str = Depends(oauth2_scheme),
+    admin_token_cookie: Optional[str] = Cookie(default=None, alias="admin_token"),
+):
+    """Cookie'ni o'chiradi VA token'ni revocation list'ga qo'shadi (#19).
+    Endi token expiry'gacha amal qilmaydi — logout darhol yaroqsiz qiladi."""
+    effective_token = admin_token_cookie or token
+    if effective_token:
+        try:
+            payload = jwt.decode(effective_token, SECRET_KEY, algorithms=[ALGORITHM])
+            jti = payload.get("jti")
+            if jti:
+                _revoke_token(jti)
+        except JWTError:
+            pass
+    response.delete_cookie("admin_token")
+    return {"status": "logged_out"}
 
 @app.post("/users/register", response_model=schemas.UserSchema)
 def register_user(name: str = Form(...), email: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):

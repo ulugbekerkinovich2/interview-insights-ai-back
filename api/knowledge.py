@@ -1082,8 +1082,308 @@ def chat_knowledge(
             return _chat_status(user)
 
     # Default: RAG question
+    import time as _time
+    t0 = _time.time()
     result = kb.run_chat(query, role=role, top_k=payload.top_k or 5)
+    latency_ms = int((_time.time() - t0) * 1000)
+    _log_chat_query(db, user, query, result, latency_ms=latency_ms, streamed=False)
     return schemas.KnowledgeChatResponse(**result)
+
+
+# =============================================================================
+# Streaming chat endpoint (SSE)
+# =============================================================================
+
+@router.post("/chat/stream")
+async def chat_knowledge_stream(
+    request: Request,
+    payload: schemas.KnowledgeChatRequest,
+    db: Session = Depends(_get_db),
+    user: database.User = Depends(_require_authenticated),
+):
+    """Server-Sent Events orqali token-by-token streaming javob.
+
+    #17 — endi client disconnect'ni aniqlaydi: foydalanuvchi Stop bossa va
+    fetch'ni abort qilsa, server ham Mistral chaqiruvini to'xtatadi (token
+    yoqib ketishni oldini oladi).
+    """
+    import json as _json
+    import time as _time
+    import asyncio as _asyncio
+    from fastapi import Request as _FRequest  # noqa: F401
+    from fastapi.responses import StreamingResponse
+
+    query = (payload.query or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Bo'sh so'rov")
+
+    role = user.role or kb.ROLE_USER
+    intent = kb.parse_intent(query, role=role)
+    if intent is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Команды админа отправляйте через /chat (без streaming)",
+        )
+
+    user_id = user.id
+    user_role = role
+
+    async def _event_stream():
+        t0 = _time.time()
+        full_answer_parts: List[str] = []
+        meta_info: Dict[str, Any] = {}
+        done_payload: Dict[str, Any] = {}
+        cancelled = False
+        try:
+            # Generator sync, lekin biz har iteratsiyada disconnect tekshiramiz.
+            # asyncio.to_thread orqali bloklash yo'q — sync gen'ni async'da o'rab,
+            # disconnect bo'lsa break qilamiz (Mistral connection avtomatik yopiladi).
+            gen = kb.run_chat_stream(query, role=user_role, top_k=payload.top_k or 5)
+            for event in gen:
+                # Client disconnect tekshiruvi — har 50ms da ham bo'lsa cancel
+                if await request.is_disconnected():
+                    cancelled = True
+                    logger.info("stream cancelled by client")
+                    try:
+                        gen.close()  # generator __close__ → Mistral connection yopiladi
+                    except Exception:
+                        pass
+                    break
+                if event.get("type") == "meta":
+                    meta_info = event
+                elif event.get("type") == "token":
+                    full_answer_parts.append(event.get("text", ""))
+                elif event.get("type") == "done":
+                    done_payload = event
+                yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
+                # asyncio loop'ga nafas berish
+                await _asyncio.sleep(0)
+        except Exception as exc:
+            logger.exception("stream chat failed")
+            yield f"data: {_json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+            return
+
+        # Stream tugagandan keyin DB ga log yozamiz
+        latency_ms = int((_time.time() - t0) * 1000)
+        try:
+            db_session = database.SessionLocal()
+            try:
+                _conf_raw = meta_info.get("confidence")
+                # 0.0 ham haqiqiy qiymat — None bilan aralashtirmaslik
+                _conf = int(_conf_raw) if isinstance(_conf_raw, (int, float)) else None
+                _persist_chat_log(
+                    db_session,
+                    user_id=user_id,
+                    role=user_role,
+                    query=query,
+                    answer=done_payload.get("answer") or "".join(full_answer_parts),
+                    confidence=_conf,
+                    chunks_used=meta_info.get("chunks_found") or 0,
+                    citations_count=len(done_payload.get("cited_indices") or []),
+                    backend=meta_info.get("used_backend"),
+                    latency_ms=latency_ms,
+                    streamed=True,
+                    error="cancelled_by_client" if cancelled else None,
+                )
+            finally:
+                db_session.close()
+        except Exception as exc:
+            logger.warning(f"chat stream log save failed: {exc}")
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # Nginx buferlamasin
+            "Connection": "keep-alive",
+        },
+    )
+
+
+# =============================================================================
+# Chat query logging (analytics)
+# =============================================================================
+
+def _persist_chat_log(
+    db: Session,
+    *,
+    user_id: int | None,
+    role: str,
+    query: str,
+    answer: str,
+    confidence: int | None,
+    chunks_used: int,
+    citations_count: int,
+    backend: str | None,
+    latency_ms: int,
+    streamed: bool,
+    error: str | None = None,
+) -> None:
+    """ChatQueryLog jadvaliga audit yozadi (analytics uchun)."""
+    try:
+        log = database.ChatQueryLog(
+            user_id=user_id,
+            role=role,
+            query=query[:5000],
+            answer=(answer or "")[:10000],
+            confidence=confidence,
+            chunks_used=chunks_used,
+            citations_count=citations_count,
+            backend=backend,
+            latency_ms=latency_ms,
+            streamed=streamed,
+            error=error,
+        )
+        db.add(log)
+        db.commit()
+    except Exception as exc:
+        logger.warning(f"ChatQueryLog write failed: {exc}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
+def _log_chat_query(
+    db: Session, user: database.User, query: str, result: Dict[str, Any],
+    *, latency_ms: int, streamed: bool,
+) -> None:
+    """Sync chat (non-streaming) uchun audit yozish."""
+    confidence = result.get("confidence")
+    cited = result.get("cited_indices") or []
+    chunks = result.get("used_chunks") or result.get("sources") or []
+    backend = None
+    if isinstance(result.get("sources"), list) and result["sources"]:
+        backend = result["sources"][0].get("backend")
+    _persist_chat_log(
+        db,
+        user_id=user.id,
+        role=user.role or "User",
+        query=query,
+        answer=result.get("answer") or "",
+        confidence=int(confidence) if confidence is not None else None,
+        chunks_used=len(chunks),
+        citations_count=len(cited),
+        backend=backend,
+        latency_ms=latency_ms,
+        streamed=streamed,
+    )
+
+
+# =============================================================================
+# Feedback endpoint — thumbs up/down
+# =============================================================================
+
+
+@router.post("/chat/feedback/{log_id}")
+def chat_feedback(
+    log_id: int,
+    feedback: str,  # "positive" | "negative" | "clear"
+    db: Session = Depends(_get_db),
+    user: database.User = Depends(_require_authenticated),
+):
+    """ChatQueryLog yozuvi uchun foydalanuvchi feedback yangilash."""
+    if feedback not in ("positive", "negative", "clear"):
+        raise HTTPException(status_code=400, detail="feedback должен быть positive/negative/clear")
+    log = db.query(database.ChatQueryLog).filter_by(id=log_id).first()
+    if not log:
+        raise HTTPException(status_code=404, detail="Лог не найден")
+    # Faqat o'z so'rovi yoki admin
+    if log.user_id != user.id and not kb.is_super_admin(user.role):
+        raise HTTPException(status_code=403, detail="Нет доступа")
+    log.feedback = None if feedback == "clear" else feedback
+    db.commit()
+    return {"status": "ok", "feedback": log.feedback}
+
+
+# =============================================================================
+# Analytics endpoint
+# =============================================================================
+
+@router.get("/analytics")
+def chat_analytics(
+    days: int = 7,
+    db: Session = Depends(_get_db),
+    user: database.User = Depends(_require_authenticated),
+):
+    """Psixologik chat foydalanish statistikasi.
+
+    Foydalanuvchi: faqat o'z so'rovlarini ko'radi.
+    SuperAdmin: barcha so'rovlar (umumiy panel).
+    """
+    import datetime
+    from sqlalchemy import func
+
+    since = datetime.datetime.utcnow() - datetime.timedelta(days=max(1, min(days, 90)))
+    q = db.query(database.ChatQueryLog).filter(database.ChatQueryLog.created_at >= since)
+
+    if not kb.is_super_admin(user.role):
+        q = q.filter(database.ChatQueryLog.user_id == user.id)
+
+    total = q.count()
+    if total == 0:
+        return {
+            "period_days": days,
+            "total_queries": 0,
+            "avg_confidence": None,
+            "avg_latency_ms": None,
+            "feedback": {"positive": 0, "negative": 0, "none": 0},
+            "by_day": [],
+            "top_queries": [],
+        }
+
+    avg_confidence = q.with_entities(func.avg(database.ChatQueryLog.confidence)).scalar()
+    avg_latency = q.with_entities(func.avg(database.ChatQueryLog.latency_ms)).scalar()
+
+    pos = q.filter(database.ChatQueryLog.feedback == "positive").count()
+    neg = q.filter(database.ChatQueryLog.feedback == "negative").count()
+    none = total - pos - neg
+
+    # Sutkalik tarqalish
+    by_day_rows = (
+        q.with_entities(
+            func.date(database.ChatQueryLog.created_at).label("day"),
+            func.count(database.ChatQueryLog.id).label("count"),
+            func.avg(database.ChatQueryLog.confidence).label("avg_conf"),
+        )
+        .group_by(func.date(database.ChatQueryLog.created_at))
+        .order_by("day")
+        .all()
+    )
+    by_day = [
+        {
+            "date": str(r.day) if r.day else None,
+            "count": int(r.count),
+            "avg_confidence": round(float(r.avg_conf), 1) if r.avg_conf else None,
+        }
+        for r in by_day_rows
+    ]
+
+    # Eng tez-tez beriladigan savollar (oddiy LOWER LIKE bo'yicha guruhlash)
+    top_queries_rows = (
+        q.with_entities(
+            database.ChatQueryLog.query,
+            func.count(database.ChatQueryLog.id).label("count"),
+        )
+        .group_by(database.ChatQueryLog.query)
+        .order_by(func.count(database.ChatQueryLog.id).desc())
+        .limit(10)
+        .all()
+    )
+    top_queries = [
+        {"query": r.query[:120], "count": int(r.count)} for r in top_queries_rows
+    ]
+
+    return {
+        "period_days": days,
+        "total_queries": total,
+        "avg_confidence": round(float(avg_confidence), 1) if avg_confidence else None,
+        "avg_latency_ms": int(avg_latency) if avg_latency else None,
+        "feedback": {"positive": pos, "negative": neg, "none": none},
+        "by_day": by_day,
+        "top_queries": top_queries,
+    }
 
 
 @router.get("/status/qdrant")

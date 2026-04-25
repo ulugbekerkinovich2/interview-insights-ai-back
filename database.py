@@ -78,7 +78,9 @@ class Candidate(Base):
     status = Column(String, default="In Progress")
     access_code = Column(String, unique=True, index=True, nullable=True) # Will store secure 16-char token
     pin_hash = Column(String, nullable=True) # Hashed 6-digit PIN
-    owner_id = Column(Integer, ForeignKey("users.id"), nullable=True) # The Recruiter who created this
+    # User o'chirilsa — nomzodlar qoladi lekin owner_id NULL ga o'rnatiladi
+    # (audit saqlaydi, lekin ma'lumot yo'qolmaydi)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     answers = Column(JSON, default=list)
     filters = Column(JSON, default=list)  # Per-candidate HR requirements (list of strings)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
@@ -86,7 +88,8 @@ class Candidate(Base):
 class VisualRecord(Base):
     __tablename__ = "visual_records"
     id = Column(Integer, primary_key=True, index=True)
-    candidate_id = Column(Integer, ForeignKey("candidates.id"))
+    # Candidate o'chirilsa — uning barcha video kadrlari ham o'chiriladi (GDPR + tozalik)
+    candidate_id = Column(Integer, ForeignKey("candidates.id", ondelete="CASCADE"))
     emotion = Column(String)
     stress_level = Column(String)
     notes = Column(Text)
@@ -104,7 +107,8 @@ class ChatMessage(Base):
 class Notification(Base):
     __tablename__ = "notifications"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # null = broadcast to all
+    # User o'chirilsa — uning shaxsiy notifikatsiyalari o'chiriladi
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     title = Column(String)
     message = Column(Text)
     type = Column(String, default="info")  # info, success, warning, error
@@ -128,8 +132,9 @@ class KnowledgeDocument(Base):
     category = Column(String, nullable=True, index=True)
     language = Column(String, default="uz", index=True)
     approved = Column(Boolean, default=False, index=True)
-    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
-    approved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # User o'chirilsa — hujjat saqlanib qoladi (audit), faqat yaratuvchi NULL
+    created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    approved_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     approved_at = Column(DateTime, nullable=True)
     chunks_count = Column(Integer, default=0)
@@ -141,7 +146,8 @@ class RetrainJob(Base):
     id = Column(Integer, primary_key=True, index=True)
     # pending | running | completed | failed
     status = Column(String, default="pending", index=True)
-    triggered_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # User o'chirilsa audit saqlanadi (SET NULL)
+    triggered_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     started_at = Column(DateTime, default=datetime.datetime.utcnow)
     finished_at = Column(DateTime, nullable=True)
     total_docs = Column(Integer, default=0)
@@ -152,6 +158,58 @@ class RetrainJob(Base):
     current_doc_id = Column(Integer, nullable=True)
     failed_ids = Column(JSON, default=list)
     error = Column(Text, nullable=True)
+
+
+class ChatQueryLog(Base):
+    """Psixologik chat query'larining audit logi.
+
+    Har RAG so'rov uchun yoziladi — analytics, sifat tahlili va xarajat
+    nazorati uchun. Foydalanuvchi feedback'i (👍/👎) keyinchalik PATCH
+    endpointi orqali yangilanadi.
+    """
+    __tablename__ = "chat_query_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    role = Column(String, index=True)                    # SuperAdmin / Psychologist / User
+    query = Column(Text, nullable=False)
+    answer = Column(Text)
+    confidence = Column(Integer, nullable=True)          # 0-100
+    chunks_used = Column(Integer, default=0)             # Necha chunk ishlatildi
+    citations_count = Column(Integer, default=0)         # Necha citation [N] LLM da ishlatildi
+    backend = Column(String)                             # "langchain" | "direct"
+    feedback = Column(String, nullable=True, index=True) # "positive" | "negative" | NULL
+    latency_ms = Column(Integer)                         # Total response time
+    streamed = Column(Boolean, default=False)            # Stream orqali yuborilganmi
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+
+class JobRecord(Base):
+    """Celery task audit jadvali.
+
+    Celery o'zining result backend (Redis) da vaqtinchalik natijalarni saqlaydi,
+    lekin audit va debugging uchun ushbu jadvalga persistent yozuv yozamiz.
+    Task signallari (`task_prerun`, `task_postrun`, `task_failure`) orqali
+    yangilanadi. Server restartida `status=running` qolgan yozuvlar startup
+    hookda `failed` ga o'zgartiriladi (stale cleanup).
+    """
+    __tablename__ = "job_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(String, unique=True, index=True, nullable=False)
+    task_name = Column(String, index=True, nullable=False)
+    # Candidate o'chirilsa — job yozuvi saqlanadi (audit), candidate_id NULL bo'ladi
+    candidate_id = Column(Integer, ForeignKey("candidates.id", ondelete="SET NULL"), index=True, nullable=True)
+    # queued | running | success | failed | retry
+    status = Column(String, default="queued", index=True, nullable=False)
+    payload = Column(JSON, nullable=True)
+    result = Column(JSON, nullable=True)
+    error = Column(Text, nullable=True)
+    attempts = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
 
 
 def init_db():

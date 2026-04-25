@@ -28,3 +28,11 @@ langchain-core>=0.3.0
 langchain-community>=0.3.0
 langchain-mistralai>=0.2.0
 langchain-qdrant>=0.2.0
+
+# Background job queue (Celery + Redis)
+celery[redis]==5.3.6
+redis==5.0.1
+flower==2.0.1
+
+# Error tracking (ixtiyoriy — SENTRY_DSN env'da bo'lsa yoqiladi)
+sentry-sdk[fastapi]==2.18.0
