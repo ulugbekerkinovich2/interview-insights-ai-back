@@ -2368,6 +2368,16 @@ async def webrtc_signaling(websocket: WebSocket, candidate_id: int, token: Optio
         await websocket.close(code=4001)
         return
 
+    # Kandidat DB'da haqiqatan mavjudligini tekshirish — fantom in-memory
+    # room'larni oldini olish (yo'q kandidatga ulanib bo'lmaydi).
+    # Auth'dan KEYIN tekshiramiz (anonymous probe'ni oldini olish uchun).
+    with SessionLocal() as session:
+        cand_exists = session.query(Candidate.id).filter_by(id=candidate_id).first()
+        if not cand_exists:
+            logger.warning(f"[WebRTC] Candidate {candidate_id} not found in DB — closing")
+            await websocket.close(code=4404, reason="Candidate not found")
+            return
+
     await websocket.accept()
     room = _get_room(int(candidate_id))
     
