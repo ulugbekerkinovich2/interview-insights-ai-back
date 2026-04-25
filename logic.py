@@ -186,7 +186,18 @@ def _transcribe_whisper(audio_path: str) -> str:
 
 
 def transcribe_audio(audio_path: str):
-    """Returns (transcript, elapsed_ms) tuple. Tries Deepgram first, falls back to Whisper."""
+    """Returns (transcript, elapsed_ms) tuple.
+
+    STT provider tanlash mantiqi:
+    - DEEPGRAM_API_KEY mavjud → Deepgram chaqiriladi
+    - Deepgram MUVAFFAQIYATLI bo'lsa (exception YO'Q) — natija qabul qilinadi,
+      hatto bo'sh string bo'lsa-ham (audio jim bo'lishi mumkin). Whisper'ga
+      fallback QILMAYDI — chunki bu KERAKSIZ 10-15 sek yo'qotadi.
+    - Faqat Deepgram **exception** tashlasa (network/auth fail) → Whisper fallback
+    - DEEPGRAM_API_KEY yo'q bo'lsa → to'g'ridan Whisper
+
+    Eski bug: bo'sh transkript ham "fail" deb hisoblanardi → Whisper 13 sek yo'qot.
+    """
     if not os.path.exists(audio_path):
         raise TranscriptionError("Audio file not found")
 
@@ -194,26 +205,38 @@ def transcribe_audio(audio_path: str):
     t0 = time.time()
 
     transcript = ""
-    # Try Deepgram first (fast cloud)
+    provider_used = "none"  # log uchun aniq qaysi provider ishlatildi
+    deepgram_succeeded = False  # exception otmagan = succeeded (bo'sh natija ham)
+
     if DEEPGRAM_API_KEY:
         try:
             transcript = _transcribe_deepgram(audio_path)
-            logger.info(f"Deepgram STT: {int((time.time() - t0) * 1000)}ms | {len(transcript)} chars")
+            deepgram_succeeded = True
+            provider_used = "deepgram"
+            dg_ms = int((time.time() - t0) * 1000)
+            logger.info(f"STT[deepgram]: {dg_ms}ms | {len(transcript)} chars")
         except Exception as e:
-            logger.warning(f"Deepgram failed, falling back to Whisper: {e}")
+            logger.warning(f"Deepgram exception (will fallback to Whisper): {e}")
+            deepgram_succeeded = False
 
-    # Fallback to local Whisper
-    if not transcript:
+    # Whisper fallback FAQAT Deepgram exception otganda. Bo'sh natija — fallback YOQ.
+    if not deepgram_succeeded:
         try:
             transcript = _transcribe_whisper(audio_path)
+            provider_used = "whisper"
+            wh_ms = int((time.time() - t0) * 1000)
+            logger.info(f"STT[whisper]: {wh_ms}ms | {len(transcript)} chars")
         except Exception as exc:
             raise TranscriptionError(f"Transcription failed: {exc}") from exc
 
     elapsed_ms = int((time.time() - t0) * 1000)
-    logger.info(f"Whisper STT: {elapsed_ms}ms | {len(transcript)} chars")
+    # Yagona umumiy log — qaysi provider va natija hajmi
+    logger.info(f"STT done: provider={provider_used} | {elapsed_ms}ms | {len(transcript)} chars")
 
     if not transcript:
-        raise TranscriptionError("Transcription produced no text")
+        # Audio jim bo'lishi mumkin — bo'sh transkript ham haqiqiy natija deb hisoblaymiz.
+        # Caller (process_turn_full_task) "(Речь не распознана)" placeholder'ni qo'yadi.
+        return "", elapsed_ms
 
     return transcript, elapsed_ms
 

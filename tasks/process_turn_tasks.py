@@ -79,15 +79,18 @@ def process_turn_full_task(
             logger.debug(f"WS partial broadcast skipped: {exc}")
 
     try:
-        # 1. Whisper STT — birinchi va eng tezroq ko'rsatish kerak bo'lgan natija
+        # 1. STT (Deepgram → fallback Whisper) — birinchi va eng tez ko'rsatiladigan natija
         transcript = ""
         stt_ms = 0
         t0 = _time.time()
         try:
             transcript, stt_ms = logic.transcribe_audio(audio_path)
         except Exception as e:
-            logger.warning(f"Whisper STT failed: {e}")
+            logger.warning(f"STT exception: {e}")
             transcript = "(Речь не распознана)"
+        # Bo'sh transkript — audio jim (kandidat indamadi yoki mikrofon o'chiq)
+        if not transcript:
+            transcript = "(Тишина)"
         stt_wall_ms = int((_time.time() - t0) * 1000)
 
         # ⚡ DARHOL: STT natijasini frontend'ga yuboramiz (foydalanuvchi
