@@ -146,15 +146,31 @@ def process_turn_full_task(
                 "_stage": "prosody_done",
             })
 
-        # 3. Face context + emotion aggregate
+        # 3. Face context — gaze + mouth + eyes + EMOTION + STRESS (blendshape-asoslangan)
         face_context = ""
         if parsed_face_stats:
-            face_context = (
-                f"\nДАННЫЕ ВИДЕОАНАЛИЗА ЛИЦА: Взгляд сфокусирован "
-                f"{parsed_face_stats.get('gaze_focused_pct', 0)}%, отведён "
-                f"{parsed_face_stats.get('gaze_away_pct', 0)}%, глаза закрыты "
-                f"{parsed_face_stats.get('eyes_closed_pct', 0)}%."
-            )
+            parts = [
+                f"Взгляд сфокусирован {parsed_face_stats.get('gaze_focused_pct', 0)}%",
+                f"отведён {parsed_face_stats.get('gaze_away_pct', 0)}%",
+                f"рот открыт (говорит) {parsed_face_stats.get('mouth_open_pct', 0)}%",
+                f"глаза закрыты {parsed_face_stats.get('eyes_closed_pct', 0)}%",
+            ]
+            face_context = "\nДАННЫЕ ВИДЕОАНАЛИЗА ЛИЦА: " + ", ".join(parts) + "."
+
+            # Yangi: client-side blendshape'dan kelgan emotion va stress
+            dominant_emotion = parsed_face_stats.get("dominant_emotion")
+            avg_stress = parsed_face_stats.get("avg_stress_score")
+            if dominant_emotion or avg_stress is not None:
+                emo_part = []
+                if dominant_emotion:
+                    emo_part.append(f"доминирующая эмоция (по мимике лица): {dominant_emotion}")
+                if avg_stress is not None:
+                    stress_label = "высокий" if avg_stress >= 60 else ("средний" if avg_stress >= 30 else "низкий")
+                    emo_part.append(f"уровень стресса по мимике: {stress_label} ({avg_stress}/100)")
+                face_context += (
+                    "\nМИМИКА И ЭМОЦИОНАЛЬНОЕ СОСТОЯНИЕ (реальное время, MediaPipe blendshapes): "
+                    + ", ".join(emo_part) + "."
+                )
 
         try:
             from collections import Counter

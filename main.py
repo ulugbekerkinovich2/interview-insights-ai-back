@@ -2023,22 +2023,30 @@ def process_turn_api(
         try:
             raw = json.loads(face_stats)
             if isinstance(raw, dict):
-                allowed_keys = {
+                allowed_numeric_keys = {
                     "gaze_focused_pct", "gaze_away_pct", "mouth_open_pct",
                     "eyes_closed_pct", "face_not_found_pct", "duration_sec", "total",
+                    "avg_stress_score",  # blendshape-asoslangan stress 0-100
                 }
-                clean: Dict[str, float] = {}
+                allowed_string_keys = {
+                    "dominant_emotion",  # blendshape-asoslangan emotion (Спокойный, Радость va h.k.)
+                }
+                clean: Dict[str, Any] = {}
                 for k, v in raw.items():
-                    if k not in allowed_keys:
+                    if k in allowed_string_keys:
+                        # Faqat oddiy ascii/cyrillic so'z, max 32 char
+                        if isinstance(v, str) and len(v) <= 32:
+                            clean[k] = v
+                        continue
+                    if k not in allowed_numeric_keys:
                         continue
                     try:
                         f = float(v)
                     except (TypeError, ValueError):
                         continue
-                    # NaN/Inf'ni tashlaymiz — LLM prompt'iga "NaN%" tushib qolmasligi uchun
                     if f != f or f in (float("inf"), float("-inf")):
                         continue
-                    if k.endswith("_pct"):
+                    if k.endswith("_pct") or k == "avg_stress_score":
                         f = max(0.0, min(100.0, f))
                     clean[k] = round(f, 1)
                 parsed_face_stats = clean if clean else None
