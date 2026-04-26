@@ -1888,14 +1888,21 @@ async def transcribe_audio_api(request: Request, file: UploadFile = File(...), s
 
 @app.get("/logic/stt-result/{task_id}")
 def get_stt_result(task_id: str, db: Session = Depends(get_db)):
+    """STT natijasini polling orqali olish.
+
+    IDEMPOTENT — bir necha marta poll qilish mumkin (frontend polling +
+    WebSocket broadcast race oldini olish). Avval birinchi o'qishda DB'dan
+    o'chirib yuborardi — bu Celery cross-process WS broadcast yo'qotganda
+    polling fallback'i ishlamasligiga olib kelardi.
+
+    Eski stt_result_* yozuvlari saqlanadi (har biri ~200 byte). Periodik
+    cleanup boshqa joyda amalga oshirilishi mumkin (hozirda yo'q —
+    foydalanuvchi sessiya davomida bu arziydi).
+    """
     setting = db.query(GlobalSetting).filter(GlobalSetting.key == f"stt_result_{task_id}").first()
     if not setting:
         return {"status": "processing"}
-    result = setting.value
-    # Cleanup after reading
-    db.delete(setting)
-    db.commit()
-    return result
+    return setting.value
 
 @app.post("/logic/analyze/")
 async def analyze_answer_api(question: str, answer: str, _: database.User = Depends(require_admin)):
