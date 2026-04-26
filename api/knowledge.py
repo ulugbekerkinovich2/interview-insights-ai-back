@@ -271,6 +271,94 @@ def knowledge_metrics(
     return {"metrics": rag_metrics.snapshot(), "rate_limit": embed_bucket_stats()}
 
 
+# DIQQAT: /analytics route /{doc_id} dan OLDIN bo'lishi kerak
+# (FastAPI route order — aks holda "analytics" string'i doc_id deb qabul qilinadi
+# va Pydantic int_parsing xato beradi).
+@router.get("/analytics")
+def chat_analytics(
+    days: int = 7,
+    db: Session = Depends(_get_db),
+    user: database.User = Depends(_require_authenticated),
+):
+    """Psixologik chat foydalanish statistikasi.
+
+    Foydalanuvchi: faqat o'z so'rovlarini ko'radi.
+    SuperAdmin: barcha so'rovlar (umumiy panel).
+    """
+    import datetime
+    from sqlalchemy import func
+
+    since = datetime.datetime.utcnow() - datetime.timedelta(days=max(1, min(days, 90)))
+    q = db.query(database.ChatQueryLog).filter(database.ChatQueryLog.created_at >= since)
+
+    if not kb.is_super_admin(user.role):
+        q = q.filter(database.ChatQueryLog.user_id == user.id)
+
+    total = q.count()
+    if total == 0:
+        return {
+            "period_days": days,
+            "total_queries": 0,
+            "avg_confidence": None,
+            "avg_latency_ms": None,
+            "feedback": {"positive": 0, "negative": 0, "none": 0},
+            "by_day": [],
+            "top_queries": [],
+        }
+
+    avg_confidence = q.with_entities(func.avg(database.ChatQueryLog.confidence)).scalar()
+    avg_latency = q.with_entities(func.avg(database.ChatQueryLog.latency_ms)).scalar()
+
+    pos = q.filter(database.ChatQueryLog.feedback == "positive").count()
+    neg = q.filter(database.ChatQueryLog.feedback == "negative").count()
+    none = total - pos - neg
+
+    # Sutkalik tarqalish
+    by_day_rows = (
+        q.with_entities(
+            func.date(database.ChatQueryLog.created_at).label("day"),
+            func.count(database.ChatQueryLog.id).label("count"),
+            func.avg(database.ChatQueryLog.confidence).label("avg_conf"),
+        )
+        .group_by(func.date(database.ChatQueryLog.created_at))
+        .order_by("day")
+        .all()
+    )
+    by_day = [
+        {
+            "date": str(r.day) if r.day else None,
+            "count": int(r.count),
+            "avg_confidence": round(float(r.avg_conf), 1) if r.avg_conf else None,
+        }
+        for r in by_day_rows
+    ]
+
+    # Eng tez-tez beriladigan savollar (oddiy LOWER LIKE bo'yicha guruhlash)
+    top_queries_rows = (
+        q.with_entities(
+            database.ChatQueryLog.query,
+            func.count(database.ChatQueryLog.id).label("count"),
+        )
+        .group_by(database.ChatQueryLog.query)
+        .order_by(func.count(database.ChatQueryLog.id).desc())
+        .limit(10)
+        .all()
+    )
+    top_queries = [
+        {"query": r.query[:120], "count": int(r.count)} for r in top_queries_rows
+    ]
+
+    return {
+        "period_days": days,
+        "total_queries": total,
+        "avg_confidence": round(float(avg_confidence), 1) if avg_confidence else None,
+        "avg_latency_ms": int(avg_latency) if avg_latency else None,
+        "feedback": {"positive": pos, "negative": neg, "none": none},
+        "by_day": by_day,
+        "top_queries": top_queries,
+    }
+
+
 @router.get("/{doc_id}", response_model=schemas.KnowledgeDocSchema)
 def get_knowledge(
     doc_id: int,
@@ -1297,93 +1385,8 @@ def chat_feedback(
 
 
 # =============================================================================
-# Analytics endpoint
+# Analytics endpoint /analytics yuqorida (route order — /{doc_id} dan oldin)
 # =============================================================================
-
-@router.get("/analytics")
-def chat_analytics(
-    days: int = 7,
-    db: Session = Depends(_get_db),
-    user: database.User = Depends(_require_authenticated),
-):
-    """Psixologik chat foydalanish statistikasi.
-
-    Foydalanuvchi: faqat o'z so'rovlarini ko'radi.
-    SuperAdmin: barcha so'rovlar (umumiy panel).
-    """
-    import datetime
-    from sqlalchemy import func
-
-    since = datetime.datetime.utcnow() - datetime.timedelta(days=max(1, min(days, 90)))
-    q = db.query(database.ChatQueryLog).filter(database.ChatQueryLog.created_at >= since)
-
-    if not kb.is_super_admin(user.role):
-        q = q.filter(database.ChatQueryLog.user_id == user.id)
-
-    total = q.count()
-    if total == 0:
-        return {
-            "period_days": days,
-            "total_queries": 0,
-            "avg_confidence": None,
-            "avg_latency_ms": None,
-            "feedback": {"positive": 0, "negative": 0, "none": 0},
-            "by_day": [],
-            "top_queries": [],
-        }
-
-    avg_confidence = q.with_entities(func.avg(database.ChatQueryLog.confidence)).scalar()
-    avg_latency = q.with_entities(func.avg(database.ChatQueryLog.latency_ms)).scalar()
-
-    pos = q.filter(database.ChatQueryLog.feedback == "positive").count()
-    neg = q.filter(database.ChatQueryLog.feedback == "negative").count()
-    none = total - pos - neg
-
-    # Sutkalik tarqalish
-    by_day_rows = (
-        q.with_entities(
-            func.date(database.ChatQueryLog.created_at).label("day"),
-            func.count(database.ChatQueryLog.id).label("count"),
-            func.avg(database.ChatQueryLog.confidence).label("avg_conf"),
-        )
-        .group_by(func.date(database.ChatQueryLog.created_at))
-        .order_by("day")
-        .all()
-    )
-    by_day = [
-        {
-            "date": str(r.day) if r.day else None,
-            "count": int(r.count),
-            "avg_confidence": round(float(r.avg_conf), 1) if r.avg_conf else None,
-        }
-        for r in by_day_rows
-    ]
-
-    # Eng tez-tez beriladigan savollar (oddiy LOWER LIKE bo'yicha guruhlash)
-    top_queries_rows = (
-        q.with_entities(
-            database.ChatQueryLog.query,
-            func.count(database.ChatQueryLog.id).label("count"),
-        )
-        .group_by(database.ChatQueryLog.query)
-        .order_by(func.count(database.ChatQueryLog.id).desc())
-        .limit(10)
-        .all()
-    )
-    top_queries = [
-        {"query": r.query[:120], "count": int(r.count)} for r in top_queries_rows
-    ]
-
-    return {
-        "period_days": days,
-        "total_queries": total,
-        "avg_confidence": round(float(avg_confidence), 1) if avg_confidence else None,
-        "avg_latency_ms": int(avg_latency) if avg_latency else None,
-        "feedback": {"positive": pos, "negative": neg, "none": none},
-        "by_day": by_day,
-        "top_queries": top_queries,
-    }
-
 
 @router.get("/status/qdrant")
 def qdrant_status(admin: database.User = Depends(_require_super_admin)):
