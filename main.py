@@ -417,8 +417,9 @@ DEFAULT_FEATURE_FLAGS = [
     {"name": "interview_timer", "description": "Nomzod sessiyasida vaqt taymerini ko'rsatish", "is_enabled": True},
     {"name": "stress_overlay", "description": "Interview LIVE oynasida stress overlay effektini yoqish", "is_enabled": True},
     {"name": "gaze_tracking", "description": "AI Visual blokida gaze (nigoh) diagnostikasini ko'rsatish", "is_enabled": True},
-    {"name": "ai_suggestions", "description": "Javobdan keyin AI tavsiya savollarini yaratish", "is_enabled": True},
+    {"name": "ai_suggestions", "description": "Intervyu console'da AI keyingi qadam tavsiyasini ko'rsatish", "is_enabled": True},
     {"name": "vocal_analysis", "description": "Nomzod ovozi bo'yicha prosody va holat tahlilini yoqish", "is_enabled": True},
+    {"name": "hr_filters_panel", "description": "Intervyu console'da HR talablarini (filterlar) ko'rsatish va tahrirlash", "is_enabled": True},
 ]
 
 # --- WebRTC Signaling ---
