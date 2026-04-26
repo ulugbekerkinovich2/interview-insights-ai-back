@@ -56,6 +56,31 @@ def _safe_rag(question: str, transcript: str, face_context: str) -> str:
         return "AI анализ недоступен"
 
 
+def _safe_rag_stream(question: str, transcript: str, face_context: str, on_token):
+    """Streaming variant — har token kelganda `on_token(accumulated_text)` chaqiriladi.
+    Yakuniy to'liq matnni qaytaradi. Fail-safe — xato bo'lsa fallback string qaytaradi.
+    """
+    import logic as _logic
+    accumulated = ""
+    try:
+        for chunk in _logic.analyze_answer_stream(question, transcript, context=face_context):
+            accumulated += chunk
+            try:
+                on_token(accumulated)
+            except Exception as cb_exc:
+                logger.debug(f"RAG stream callback error (ignored): {cb_exc}")
+        return accumulated or "AI анализ недоступен"
+    except Exception as e:
+        logger.warning(f"RAG analyze_answer_stream failed: {e}")
+        # Streaming xato bo'lsa, sync fallback'ga o'tamiz (1 marta urinish)
+        if not accumulated:
+            try:
+                return _logic.analyze_answer(question, transcript, context=face_context)
+            except Exception:
+                return "AI анализ недоступен"
+        return accumulated
+
+
 def _build_face_context(
     parsed_face_stats: Optional[Dict[str, Any]],
     candidate_id: int,
@@ -243,7 +268,6 @@ def process_turn_pipeline(
 
         prosody_future = _parallel_pool.submit(_safe_prosody, audio_path)
         smooth_future = _parallel_pool.submit(_safe_smooth, transcript_raw, smooth_enabled)
-        rag_future = _parallel_pool.submit(_safe_rag, question, transcript_raw, face_context)
 
         # Prosody odatda eng tez tugaydi (0.5-2s) — uni alohida kutib darhol broadcast
         try:
@@ -281,12 +305,40 @@ def process_turn_pipeline(
                 "_stage": "smooth_done",
             })
 
-        # RAG — eng oxiri (3-10s). Smooth+prosody bilan parallel ishlagani uchun
-        # ai_ms = parallel boshlangandan to RAG natijasi kelgangacha (wall clock).
+        # RAG — STREAMING. Har token kelganda faqat WS broadcast qilamiz (DB ga
+        # yozmaymiz — 50+ token'lar har biri DB write qilsa overhead juda katta).
+        # Final ai matni pipeline oxirida `_save_turn_partial`'da bir martagina
+        # yoziladi. ChatGPT-style progressive ko'rinish — UI 1.5-2s'da boshlanib
+        # har token ~150-300ms'da keladi.
+        # Frontend `_stage="rag_streaming"` xabarni tanib `ai` field'ni overwrite
+        # qiladi (avvalgi accumulated bilan).
+        last_broadcast_ms = 0
+        BROADCAST_THROTTLE_MS = 200  # har 200ms da bir broadcast
+
+        def _on_token(accumulated: str) -> None:
+            nonlocal last_broadcast_ms
+            now_ms = int(_time.time() * 1000)
+            if now_ms - last_broadcast_ms < BROADCAST_THROTTLE_MS:
+                return
+            last_broadcast_ms = now_ms
+            try:
+                # WS-only broadcast (DB write skip — streaming oxirida bir marta yoziladi)
+                _broadcast_turn({
+                    "type": "TURN_RESULT",
+                    "candidate_id": candidate_id,
+                    "question": question,
+                    "audio_url": audio_url,
+                    "turn_uid": turn_uid,
+                    "ai": accumulated,
+                    "_stage": "rag_streaming",
+                })
+            except Exception:
+                pass
+
         try:
-            rag_ai = rag_future.result(timeout=180)
+            rag_ai = _safe_rag_stream(question, transcript_raw, face_context, _on_token)
         except Exception as e:
-            logger.warning(f"RAG result fetch failed: {e}")
+            logger.warning(f"RAG streaming failed: {e}")
             rag_ai = "AI анализ недоступен"
         ai_ms = int((_time.time() - parallel_started_at) * 1000)
         _parallel_pool.shutdown(wait=False)

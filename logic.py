@@ -547,6 +547,154 @@ def analyze_answer(question: str, answer: str, context: str = "") -> str:
     return _call_ai(prompt)
 
 
+def _call_mistral_cloud_stream(prompt: str):
+    """Mistral Cloud streaming — token'larni iterator sifatida qaytaradi."""
+    if not MISTRAL_API_KEY:
+        raise AIServiceError("MISTRAL_API_KEY not set")
+    try:
+        from utils import cost_tracker
+        cost_tracker.check_limits()
+    except Exception as exc:
+        raise AIServiceError(str(exc))
+
+    headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
+    data = {
+        "model": MISTRAL_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 2048,
+        "stream": True,
+    }
+    full_text = ""
+    try:
+        resp = http_requests.post(MISTRAL_API_URL, json=data, headers=headers, timeout=300, stream=True)
+        resp.raise_for_status()
+        import json as _json
+        for raw_line in resp.iter_lines():
+            if not raw_line:
+                continue
+            try:
+                line = raw_line.decode("utf-8") if isinstance(raw_line, (bytes, bytearray)) else raw_line
+            except Exception:
+                continue
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                chunk = _json.loads(payload)
+            except Exception:
+                continue
+            try:
+                delta = chunk["choices"][0].get("delta", {}) or {}
+                content = delta.get("content", "")
+                if content:
+                    full_text += content
+                    yield content
+            except (KeyError, IndexError, TypeError):
+                continue
+    except http_requests.RequestException as exc:
+        raise AIServiceError(f"Mistral stream failed: {exc}") from exc
+
+    if not full_text:
+        raise AIServiceError("Mistral stream returned empty response")
+
+    # Cost tracking — ozroq aniqlik (full_text taxminiy)
+    try:
+        cost = cost_tracker.estimate_mistral_cost(len(prompt), len(full_text))
+        cost_tracker.record("mistral", cost)
+    except Exception:
+        pass
+
+
+def _call_ollama_stream(prompt: str):
+    """Ollama streaming — line-delimited JSON token'lar."""
+    try:
+        resp = http_requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": True},
+            headers=_ollama_headers(),
+            timeout=120,
+            stream=True,
+        )
+        resp.raise_for_status()
+    except http_requests.RequestException as exc:
+        raise AIServiceError(f"Ollama stream failed: {exc}") from exc
+
+    import json as _json
+    full_text = ""
+    for raw_line in resp.iter_lines():
+        if not raw_line:
+            continue
+        try:
+            line = raw_line.decode("utf-8") if isinstance(raw_line, (bytes, bytearray)) else raw_line
+            chunk = _json.loads(line)
+        except Exception:
+            continue
+        token = chunk.get("response", "")
+        if token:
+            full_text += token
+            yield token
+        if chunk.get("done"):
+            break
+
+    if not full_text:
+        raise AIServiceError("Ollama stream returned empty response")
+
+
+def _call_ai_stream(prompt: str):
+    """Streaming variant — `_call_ai` mantiqini ta'qib etadi (provider routing)."""
+    if AI_PROVIDER == "ollama":
+        yield from _call_ollama_stream(prompt)
+        return
+    if AI_PROVIDER == "mistral":
+        yield from _call_mistral_cloud_stream(prompt)
+        return
+    if AI_PROVIDER in {"auto", "mistral_then_ollama"}:
+        if MISTRAL_API_KEY:
+            try:
+                yield from _call_mistral_cloud_stream(prompt)
+                return
+            except AIServiceError as exc:
+                logger.warning(f"Mistral stream error, falling back to Ollama: {exc}")
+        yield from _call_ollama_stream(prompt)
+        return
+    if AI_PROVIDER == "ollama_then_mistral":
+        try:
+            yield from _call_ollama_stream(prompt)
+            return
+        except AIServiceError as exc:
+            logger.warning(f"Ollama stream error, falling back to Mistral: {exc}")
+            if MISTRAL_API_KEY:
+                yield from _call_mistral_cloud_stream(prompt)
+                return
+            raise
+    raise AIServiceError(f"Unsupported AI_PROVIDER value: {AI_PROVIDER}")
+
+
+def analyze_answer_stream(question: str, answer: str, context: str = ""):
+    """Stream variant of `analyze_answer` — token'larni asta yetkazadi.
+
+    Foydalanuvchi ChatGPT-style progressive ko'rinishini olishi uchun.
+    Caller'da har bir yield'ni WS broadcast qilish mumkin.
+    """
+    try:
+        from utils.rag_service import search_context
+        rag_context = search_context(f"{question} {answer}")
+        if rag_context:
+            context = (
+                f"{context}\n\nРЕЛЕВАНТНЫЕ ДОКУМЕНТЫ КОМПАНИИ:\n{rag_context}"
+                if context
+                else rag_context
+            )
+    except Exception as e:
+        logger.warning(f"RAG context retrieval failed: {e}")
+
+    prompt = _build_analysis_prompt(question, answer, context)
+    yield from _call_ai_stream(prompt)
+
+
 def ask_mistral_raw(prompt: str) -> str:
     return _call_ai(prompt)
 
