@@ -715,6 +715,27 @@ async def startup():
         # Do not crash startup; settings page will surface this if DB/migrations are missing.
         print(f"feature-flag bootstrap skipped: {exc}")
 
+    # Auto-migration: yangi ustunlar (alembic ishlamagan deploy'larda) qo'lda
+    # qo'shilishi. Hozirda: candidates.display_id (c008 migration).
+    # Postgres uchun ALTER TABLE IF NOT EXISTS sintaksisi ishlatilsa idempotent.
+    try:
+        from sqlalchemy import text as _sa_text
+        with database.engine.begin() as conn:
+            # display_id ustunini qo'shish — agar mavjud emas bo'lsa
+            conn.execute(_sa_text(
+                "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS display_id VARCHAR(8)"
+            ))
+            # Unique index — alohida statement (IF NOT EXISTS index uchun ishlaydi)
+            conn.execute(_sa_text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_candidates_display_id "
+                "ON candidates(display_id)"
+            ))
+        logger.info("Auto-migration: candidates.display_id ensured")
+    except Exception as exc:
+        # SQLite yoki boshqa DB'larda ALTER TABLE ADD COLUMN IF NOT EXISTS
+        # ishlamasligi mumkin — shu holda alembic ishlatish tavsiya etiladi.
+        logger.warning(f"Auto-migration display_id skipped: {exc}")
+
     # Stale Celery jobs cleanup — server restart qilinganda "running" yoki "queued"
     # holatida qolgan JobRecord yozuvlarini "failed" ga o'zgartirish. Bu yozuvlarni
     # kutayotgan klientlar yangi urinishni boshlashi mumkin.
