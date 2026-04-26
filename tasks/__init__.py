@@ -8,3 +8,13 @@ Modul strukturasi:
 
 Celery avtomatik bu paketdan tasklarni aniqlaydi (``celery_app.include``).
 """
+# Defensive sys.path fix — Celery worker fork'idan keyin ham `import logic`,
+# `from database import ...` ishlasin. celery_app.py'da bir marta qilinadi,
+# lekin ba'zi spawn-rejimlarida (e.g. solo pool, debug) qaytadan bo'shatiladi.
+# Bu yerda har bir task module import qilinishi bilan birga sys.path tekshiriladi.
+import sys
+from pathlib import Path
+
+_BACKEND_DIR = Path(__file__).resolve().parent.parent
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
