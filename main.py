@@ -420,6 +420,7 @@ DEFAULT_FEATURE_FLAGS = [
     {"name": "ai_suggestions", "description": "Intervyu console'da AI keyingi qadam tavsiyasini ko'rsatish", "is_enabled": True},
     {"name": "vocal_analysis", "description": "Nomzod ovozi bo'yicha prosody va holat tahlilini yoqish", "is_enabled": True},
     {"name": "hr_filters_panel", "description": "Intervyu console'da HR talablarini (filterlar) ko'rsatish va tahrirlash", "is_enabled": True},
+    {"name": "chat_citations", "description": "Psixolog AI chat'da iqtiboslar va manbalar ([1], [2]...) ko'rsatish", "is_enabled": False},
 ]
 
 # --- WebRTC Signaling ---
