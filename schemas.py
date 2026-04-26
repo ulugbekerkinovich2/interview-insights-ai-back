@@ -21,6 +21,7 @@ class CandidateCreate(CandidateBase):
 
 class CandidateSchema(CandidateBase):
     id: int
+    display_id: Optional[str] = None  # YYMMNNNN format (e.g. 26040001)
 
     class Config:
         from_attributes = True

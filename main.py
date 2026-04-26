@@ -1344,30 +1344,85 @@ def read_latest_visual_frame(
 def read_candidate(candidate_id: int, db: Session = Depends(get_db), _: database.User = Depends(require_admin)):
     return get_candidate_or_404(db, candidate_id)
 
+def _generate_display_id(db: Session, ts: Optional[datetime.datetime] = None) -> str:
+    """Kandidat uchun foydalanuvchi-do'st ID format: YYMMNNNN.
+
+    Misol: 26040001 — 2026-yil 04-oy 0001-nomzod (shu oy ichida).
+    NN qism shu oy ichidagi nomzodlar soni + 1 sifatida hisoblanadi.
+
+    Race condition'dan himoya: SQLAlchemy unique constraint + retry. Ehtimol
+    bo'lmagan bir vaqtda 2 ta nomzod yaratilsa, IntegrityError tushadi va
+    retry'da yangi raqam olinadi.
+    """
+    if ts is None:
+        ts = datetime.datetime.utcnow()
+    yy = ts.strftime("%y")  # 26
+    mm = ts.strftime("%m")  # 04
+    prefix = f"{yy}{mm}"
+
+    # Shu oyda mavjud eng katta display_id ni topib, +1 qaytaramiz
+    last = (
+        db.query(database.Candidate.display_id)
+        .filter(database.Candidate.display_id.like(f"{prefix}%"))
+        .order_by(database.Candidate.display_id.desc())
+        .first()
+    )
+    next_seq = 1
+    if last and last[0]:
+        try:
+            next_seq = int(last[0][4:]) + 1
+        except (ValueError, IndexError):
+            next_seq = 1
+    return f"{prefix}{next_seq:04d}"
+
+
 @app.post("/candidates/", response_model=schemas.CandidateCreateResponse)
 def create_candidate(candidate: schemas.CandidateCreate, db: Session = Depends(get_db), current_user: database.User = Depends(require_role(["SuperAdmin", "Recruiter"]))):
     # Sanitize name
     safe_name = bleach.clean(candidate.name, tags=[], strip=True) if candidate.name else ""
-    
+
     # Generate secure 16-char access token and a 6-digit PIN
     access_token = secrets.token_urlsafe(16)
     pin = "".join(secrets.choice(string.digits) for _ in range(6))
-    
-    db_candidate = Candidate(
-        name=safe_name,
-        summary=candidate.summary,
-        status=candidate.status,
-        access_code=access_token, # This is our long secure token
-        pin_hash=get_password_hash(pin), # We hash the 6-digit PIN
-        owner_id=current_user.id if current_user else None,
-        answers=candidate.answers,
-    )
-    db.add(db_candidate)
-    db.commit()
-    db.refresh(db_candidate)
-    
+
+    # Foydalanuvchi-do'st ID generatsiya — 2 marta retry race condition uchun
+    display_id = None
+    for _ in range(3):
+        try:
+            display_id = _generate_display_id(db)
+            db_candidate = Candidate(
+                name=safe_name,
+                summary=candidate.summary,
+                status=candidate.status,
+                access_code=access_token,
+                pin_hash=get_password_hash(pin),
+                owner_id=current_user.id if current_user else None,
+                answers=candidate.answers,
+                display_id=display_id,
+            )
+            db.add(db_candidate)
+            db.commit()
+            db.refresh(db_candidate)
+            break
+        except Exception as exc:
+            db.rollback()
+            logger.warning(f"create_candidate retry (display_id={display_id}): {exc}")
+    else:
+        # Barcha retrylar muvaffaqiyatsiz — display_id'siz yaratamiz
+        db_candidate = Candidate(
+            name=safe_name,
+            summary=candidate.summary,
+            status=candidate.status,
+            access_code=access_token,
+            pin_hash=get_password_hash(pin),
+            owner_id=current_user.id if current_user else None,
+            answers=candidate.answers,
+        )
+        db.add(db_candidate)
+        db.commit()
+        db.refresh(db_candidate)
+
     # Important: We return the plain PIN only ONCE during creation
-    # The frontend should display this to the recruiter
     res = schemas.CandidateCreateResponse.from_orm(db_candidate)
     res.pin = pin
     return res
