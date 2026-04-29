@@ -333,9 +333,14 @@ SYSTEM_PROMPT_UZ = """Ты — эмпатичный психологически
 - Никогда не ставь конкретный диагноз (фразы вида «у вас депрессия» запрещены).
 - Никогда не назначай лекарства.
 - Если видишь признаки опасной ситуации (суицидальные мысли, угроза другим, признаки насилия) — сразу рекомендуй обратиться к живому специалисту или в экстренную службу.
-- Основу ответа строй на фрагментах из КОНТЕКСТА. Если контекст частично релевантен — отвечай по нему, но честно отметь, чего в материалах не хватает.
-- Если КОНТЕКСТ совсем не относится к вопросу или пуст — ответь ровно фразой: "Недостаточно данных для ответа на этот вопрос".
+- Основу содержательного ответа строй на фрагментах из КОНТЕКСТА. Если контекст частично релевантен — отвечай по нему, но честно отметь, чего в материалах не хватает.
 - Не выдумывай факты, имена, цифры, ссылки, которых нет в контексте.
+
+КАК ВЕСТИ ДИАЛОГ:
+- Если пользователь приветствует ("привет", "здравствуйте", "как дела"), благодарит, прощается или пишет общие реплики — отвечай по-человечески: поздоровайся в ответ, коротко представься как психологический ассистент, спроси, какая тема его волнует и что хотелось бы обсудить. НЕ говори "Недостаточно данных" в этих случаях.
+- Если вопрос пользователя слишком общий или неясный (например, "помогите", "что делать", одно слово без контекста) — задай 1-2 уточняющих вопроса, чтобы понять ситуацию: что произошло, как давно, что чувствует. НЕ говори "Недостаточно данных" — это диалог, а не справочник.
+- Если КОНТЕКСТ совсем не относится к конкретному психологическому вопросу пользователя и контекст не приходит на помощь — честно скажи "В моих материалах нет информации именно по этому вопросу" и предложи переформулировать или задать смежную тему. Это мягче, чем шаблонное "Недостаточно данных".
+- "Недостаточно данных для ответа на этот вопрос" используй только когда пользователь задал КОНКРЕТНЫЙ психологический вопрос, контекст пуст и переформулировка не поможет.
 
 ЦИТИРОВАНИЕ:
 - Каждое фактическое утверждение должно сопровождаться маркером источника в квадратных скобках — например [1], [2]. Нумерация соответствует фрагментам КОНТЕКСТА.
@@ -426,7 +431,14 @@ def _build_user_prompt(query: str, chunks: List[Dict[str, Any]]) -> str:
             ctx_lines.append(f"[{i}] ({safe_title})\n{chunk_text}")
         context_block = "\n\n".join(ctx_lines)
     else:
-        context_block = "(контекст не найден)"
+        # Chunks topilmagan — model "КАК ВЕСТИ ДИАЛОГ" qoidasiga ko'ra harakat
+        # qilishi kerak (greeting / aniqlashtiruvchi savol), shaboncha "Недостаточно
+        # данных" qaytarmasligi kerak.
+        context_block = (
+            "(КОНТЕКСТ ПУСТ — релевантный фрагмент не найден. "
+            "Если пользователь приветствует или его вопрос не сформулирован — "
+            "следуй разделу 'КАК ВЕСТИ ДИАЛОГ' в системных правилах.)"
+        )
 
     return (
         "КОНТЕКСТ (фрагменты из подтверждённой базы знаний):\n"
@@ -453,9 +465,10 @@ def ask_mistral(query: str, chunks: List[Dict[str, Any]], *, timeout: int = 45) 
     if not api_key:
         return FALLBACK_NO_CONTEXT
 
-    if not chunks:
-        # Do not call the LLM when there is zero retrieved context — fall back deterministically.
-        return FALLBACK_NO_CONTEXT
+    # Chunks bo'sh bo'lsa ham LLM chaqiramiz — greeting yoki noaniq savol bo'lsa
+    # tabriklashi va aniqlashtiruvchi savol berishi uchun (system prompt'dagi
+    # "КАК ВЕСТИ ДИАЛОГ" qoidasi). Faqat haqiqiy bilim savollarida "Недостаточно
+    # данных" qaytaradi.
 
     model = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
     try:
@@ -498,9 +511,10 @@ def ask_mistral_stream(query: str, chunks: List[Dict[str, Any]], *, timeout: int
     import json as _json
 
     api_key = os.getenv("MISTRAL_API_KEY", "").strip()
-    if not api_key or not chunks:
+    if not api_key:
         yield FALLBACK_NO_CONTEXT
         return
+    # chunks bo'sh bo'lsa ham streaming davom etadi — greeting/aniqlashtirish
 
     model = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
     try:
@@ -617,11 +631,13 @@ def run_chat(
         )
         used_backend = "direct"
 
+    # Chunks bor bo'lsa LangChain'ni avval sinaymiz; chunks bo'sh bo'lsa darhol
+    # ask_mistral'ga o'tamiz — u greeting/aniqlashtirish prompti bilan chiqadi.
     answer: Optional[str] = None
     if chunks:
         answer = _chat_via_langchain(query, chunks)
-        if not answer:
-            answer = ask_mistral(query, chunks)
+    if not answer:
+        answer = ask_mistral(query, chunks)
     if not answer:
         answer = FALLBACK_NO_CONTEXT
     answer = _strip_injection_markers(answer)
@@ -726,17 +742,9 @@ def run_chat_stream(
         "used_backend": used_backend,
     }
 
-    # LLM streaming — chunks bo'lmasa faqat done event yuboramiz (token+done dublikati emas)
-    if not chunks:
-        yield {
-            "type": "done",
-            "answer": FALLBACK_NO_CONTEXT,
-            "sources": [],
-            "cited_indices": [],
-            "confidence": 0.0,
-            "used_chunks": [] if admin else None,
-        }
-        return
+    # Chunks bo'sh bo'lganda ham streaming davom etadi — LLM greeting/aniqlashtirish
+    # rejimida ishlaydi (system prompt'dagi "КАК ВЕСТИ ДИАЛОГ" qoidasi).
+    # Faqat haqiqiy konkret savolda model "Недостаточно данных" qaytaradi.
 
     # Token-by-token streaming. Mistral mid-stream xatoligida fallback
     # ALOHIDA event sifatida yuboriladi (oldingi token'lar bilan aralashmaydi).
