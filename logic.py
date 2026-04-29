@@ -731,6 +731,59 @@ def run_voice_profiler(audio_path: str):
         logger.warning(f"Voice profiler error: {e}")
         return f"Ошибка анализа голоса: {e}"
 
+
+_PROSODY_FAILURE_MARKERS = ("Ошибка анализа",)
+
+
+def is_prosody_failed(voice_raw: str) -> bool:
+    """Voice profiler natijasi xato yoki bo'shmi (frontend regex'i parse qila olmaydimi)."""
+    if not voice_raw or not voice_raw.strip():
+        return True
+    return any(voice_raw.lstrip().startswith(m) for m in _PROSODY_FAILURE_MARKERS)
+
+
+def estimate_prosody_via_llm(transcript: str, duration_sec: float = 0.0) -> str:
+    """LLM (Mistral→Ollama fallback) orqali transkripsiyadan stress/ton/emotsiya
+    baholash. Frontend ``parseVoiceRaw`` regex'i ishlashi uchun aynan
+    ``format_report`` formatida matn qaytaradi.
+
+    Prosody librosa xatoga uchragan paytda fallback sifatida ishlatiladi.
+    """
+    text = (transcript or "").strip()
+    if not text or text in {"(Тишина)", "(Речь не распознана)"}:
+        return ""
+
+    dur_str = f"{duration_sec:.1f}" if duration_sec and duration_sec > 0 else "0"
+    prompt = (
+        "Ты — эксперт по голосовой и текстовой просодии. На основании транскрипта "
+        "ответа кандидата оцени стресс, тон, эмоции и артикуляцию. Учитывай: "
+        "длину фраз, наличие колебаний (эээ, ну, как бы), сложность синтаксиса, "
+        "повторы, обрывы. Голосовых данных нет — оценка по тексту.\n\n"
+        f"ТРАНСКРИПТ:\n{text}\n\n"
+        f"ДЛИТЕЛЬНОСТЬ АУДИО (сек): {dur_str}\n\n"
+        "Верни ответ СТРОГО в следующем формате (ровно 9 строк, без вступления):\n"
+        "🟢 Стресс: <Низкий|Средний|Высокий>\n"
+        "🎭 Тон: <2-4 слова>\n"
+        "💭 Эмоции: <2-4 слова>\n"
+        "🗣 Артикуляция: <2-5 слов>\n"
+        "📊 Стабильность голоса: <число 0-100>%\n"
+        "🔊 Стабильность энергии: <число 0-100>%\n"
+        "⏱ Темп: <число> bpm | Паузы: <число>%\n"
+        f"🕐 Длительность: {dur_str}с\n"
+        "ℹ️ (оценка по тексту — голосовая модель недоступна)\n\n"
+        "Эмодзи стресса: 🟢 для Низкий, 🟡 для Средний, 🔴 для Высокий."
+    )
+    try:
+        out = _call_ai(prompt).strip()
+    except AIServiceError as exc:
+        logger.warning(f"Prosody LLM fallback failed: {exc}")
+        return ""
+    # Asosiy marker'lar borligini tasdiqlaymiz — yo'q bo'lsa fallback bo'sh
+    if "Стресс:" not in out or "Тон:" not in out:
+        logger.warning("Prosody LLM fallback returned malformed text; discarding")
+        return ""
+    return out
+
 def run_candidate_profiler(audio_path: str, transcript_path: str, visual_path: str, question: str, answer: str, voice_analysis: str, rag_analysis: str):
     script_path = os.path.join(PROJECT_DIR, "utils", "candidate_profiler.py")
     if not os.path.exists(script_path):

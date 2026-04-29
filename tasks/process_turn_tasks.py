@@ -34,6 +34,58 @@ def _safe_prosody(audio_path: str) -> str:
     return result
 
 
+def _try_audio_duration(audio_path: str) -> float:
+    """Tezkor audio duration probe — librosa to'liq load qilmasdan.
+
+    Avval ``soundfile.info`` (PySoundFile), keyin ``librosa.get_duration``,
+    keyin ``audioread`` ketma-ket urinib ko'riladi. Hech qaysisi ishlamasa 0.
+    """
+    try:
+        import soundfile as _sf  # type: ignore
+        info = _sf.info(audio_path)
+        if info.frames and info.samplerate:
+            return float(info.frames) / float(info.samplerate)
+    except Exception:
+        pass
+    try:
+        import librosa as _lb  # type: ignore
+        return float(_lb.get_duration(path=audio_path))
+    except Exception:
+        pass
+    return 0.0
+
+
+def _safe_prosody_with_llm_fallback(audio_path: str, transcript: str) -> str:
+    """Prosody natijasini olish; xato yoki bo'sh bo'lsa LLM fallback (Mistral→Ollama).
+
+    Frontend ``parseVoiceRaw`` regex'i ishlashi uchun fallback ham aynan
+    ``format_report`` formatida matn qaytaradi.
+    """
+    import logic as _logic
+    voice_raw = _safe_prosody(audio_path)
+    if not _logic.is_prosody_failed(voice_raw):
+        return voice_raw
+
+    if not transcript or transcript in {"(Тишина)", "(Речь не распознана)"}:
+        # Transkripsiya ham yo'q — LLMga yuborishga arziydigan ma'lumot yo'q
+        return voice_raw
+
+    duration_sec = _try_audio_duration(audio_path)
+    logger.info(
+        "Prosody failed (raw=%r) — trying LLM fallback (transcript=%d chars, dur=%.1fs)",
+        voice_raw[:80], len(transcript), duration_sec,
+    )
+    try:
+        llm_raw = _logic.estimate_prosody_via_llm(transcript, duration_sec=duration_sec)
+    except Exception as e:
+        logger.warning(f"LLM prosody fallback raised: {e}")
+        return voice_raw
+    if llm_raw:
+        logger.info("Prosody estimated via LLM: %d chars", len(llm_raw))
+        return llm_raw
+    return voice_raw
+
+
 def _safe_smooth(transcript_raw: str, enabled: bool) -> str:
     """Transcript smoothing wrapper — fail-safe (xato bo'lsa raw qaytaradi)."""
     if not enabled or not transcript_raw or transcript_raw == "(Речь не распознана)":
@@ -266,7 +318,12 @@ def process_turn_pipeline(
         parallel_started_at = _time.time()
         smooth_enabled = os.getenv("TRANSCRIPT_SMOOTH", "true").lower() not in ("false", "0", "no")
 
-        prosody_future = _parallel_pool.submit(_safe_prosody, audio_path)
+        # Prosody — librosa xato bersa LLM (Mistral→Ollama) fallback bilan.
+        # Transkript STT'dan allaqachon kelgan — LLM uni tahlil qilib stress/ton
+        # baholashi mumkin agar haqiqiy voice analysis ishlamasa.
+        prosody_future = _parallel_pool.submit(
+            _safe_prosody_with_llm_fallback, audio_path, transcript_raw
+        )
         smooth_future = _parallel_pool.submit(_safe_smooth, transcript_raw, smooth_enabled)
 
         # Prosody odatda eng tez tugaydi (0.5-2s) — uni alohida kutib darhol broadcast
