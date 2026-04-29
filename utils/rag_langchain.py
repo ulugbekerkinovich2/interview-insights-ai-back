@@ -65,8 +65,8 @@ def _get_llm():
         _llm = ChatMistralAI(
             model=os.getenv("MISTRAL_MODEL", "mistral-small-latest"),
             api_key=api_key,
-            temperature=0.3,
-            max_tokens=700,
+            temperature=float(os.getenv("RAG_TEMPERATURE", "0.2")),
+            max_tokens=int(os.getenv("RAG_MAX_TOKENS", "1200")),
         )
         return _llm
     except Exception as exc:
@@ -117,8 +117,8 @@ def lc_search(
     query: str,
     *,
     only_approved: bool,
-    top_k: int = 5,
-    score_threshold: float = 0.35,
+    top_k: int = 8,
+    score_threshold: float = float(os.getenv("RAG_SCORE_THRESHOLD", "0.25")),
     category: Optional[str] = None,
     language: Optional[str] = None,
 ) -> List[Dict[str, Any]]:

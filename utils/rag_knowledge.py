@@ -29,7 +29,7 @@ from .rag_service import (
 )
 
 # Configurable retrieval threshold for chat (cosine similarity in [-1, 1]).
-_CHAT_SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "0.35"))
+_CHAT_SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "0.25"))
 
 logger = logging.getLogger(__name__)
 
@@ -333,8 +333,9 @@ SYSTEM_PROMPT_UZ = """Ты — эмпатичный психологически
 - Никогда не ставь конкретный диагноз (фразы вида «у вас депрессия» запрещены).
 - Никогда не назначай лекарства.
 - Если видишь признаки опасной ситуации (суицидальные мысли, угроза другим, признаки насилия) — сразу рекомендуй обратиться к живому специалисту или в экстренную службу.
-- Опирайся только на КОНТЕКСТ, указанный ниже. Если в контексте нет нужной информации, ответь ровно этой фразой: "Недостаточно данных для ответа на этот вопрос".
-- Не домысливай и не придумывай факты.
+- Основу ответа строй на фрагментах из КОНТЕКСТА. Если контекст частично релевантен — отвечай по нему, но честно отметь, чего в материалах не хватает.
+- Если КОНТЕКСТ совсем не относится к вопросу или пуст — ответь ровно фразой: "Недостаточно данных для ответа на этот вопрос".
+- Не выдумывай факты, имена, цифры, ссылки, которых нет в контексте.
 
 ЦИТИРОВАНИЕ:
 - Каждое фактическое утверждение должно сопровождаться маркером источника в квадратных скобках — например [1], [2]. Нумерация соответствует фрагментам КОНТЕКСТА.
@@ -463,8 +464,8 @@ def ask_mistral(query: str, chunks: List[Dict[str, Any]], *, timeout: int = 45) 
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
                 "model": model,
-                "temperature": 0.3,
-                "max_tokens": 700,
+                "temperature": float(os.getenv("RAG_TEMPERATURE", "0.2")),
+                "max_tokens": int(os.getenv("RAG_MAX_TOKENS", "1200")),
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT_UZ},
                     {"role": "user", "content": _build_user_prompt(query, chunks)},
@@ -512,8 +513,8 @@ def ask_mistral_stream(query: str, chunks: List[Dict[str, Any]], *, timeout: int
             },
             json={
                 "model": model,
-                "temperature": 0.3,
-                "max_tokens": 700,
+                "temperature": float(os.getenv("RAG_TEMPERATURE", "0.2")),
+                "max_tokens": int(os.getenv("RAG_MAX_TOKENS", "1200")),
                 "stream": True,
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT_UZ},
@@ -591,7 +592,7 @@ def run_chat(
     query: str,
     *,
     role: str,
-    top_k: int = 5,
+    top_k: int = 8,
     category: Optional[str] = None,
     language: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -687,7 +688,7 @@ def run_chat_stream(
     query: str,
     *,
     role: str,
-    top_k: int = 5,
+    top_k: int = 8,
     category: Optional[str] = None,
     language: Optional[str] = None,
 ):
