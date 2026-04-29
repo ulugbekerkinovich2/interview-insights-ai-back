@@ -711,12 +711,52 @@ def build_interview_summary(answers: list) -> str:
     
     full_text = "\n\n".join(blocks)
     prompt = (
-        "Сделай итоговую сводку интервью на русском. Кратко опиши: "
-        "1) сильные стороны кандидата, 2) риски/слабости, 3) общий вывод (рекомендация).\n\n"
+        "Сделай КРАТКУЮ итоговую сводку интервью на русском. ОБЯЗАТЕЛЬНО:\n"
+        "- БЕЗ markdown (никаких ###, ####, **, --). Только обычный текст.\n"
+        "- Не более 120-150 слов всего.\n"
+        "- Ровно 3 коротких раздела (заголовок без оформления, двоеточие, "
+        "затем 2-3 коротких пункта через короткое тире — каждый максимум "
+        "одно предложение).\n"
+        "- Никаких рекомендуемых дальнейших действий, эпилогов, советов от себя.\n\n"
+        "Структура (используй такие заголовки):\n"
+        "Сильные стороны:\n"
+        "— ...\n"
+        "— ...\n"
+        "Риски:\n"
+        "— ...\n"
+        "— ...\n"
+        "Вывод: одно предложение с рекомендацией (СООТВЕТСТВУЕТ / "
+        "НЕ СООТВЕТСТВУЕТ / ТРЕБУЕТ ДОП. СОБЕСЕДОВАНИЯ).\n\n"
         f"Данные интервью:\n{full_text}"
     )
     # _call_ai allaqachon AI_PROVIDER policy bo'yicha Mistral→Ollama fallback qiladi
-    return _call_ai(prompt).strip()
+    raw = _call_ai(prompt).strip()
+    # Defense-in-depth: agar model markdown belgilarini ishlatib qo'ysa, ularni
+    # tozalaymiz (eski summary'lar ham frontend tomonida tozalanadi).
+    return _strip_markdown(raw)
+
+
+_MD_HEADING_RE = re.compile(r"^\s*#{1,6}\s*", re.MULTILINE)
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_MD_ITALIC_RE = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)")
+
+
+def _strip_markdown(text: str) -> str:
+    """Markdown belgilarini olib tashlaydi (### , ####, **bold**, *italic*).
+
+    Foydalanish: AI summary'larida model talabga qaramay markdown ishlatib
+    qo'ysa, foydalanuvchi raw matnni ko'rmasligi uchun.
+    """
+    if not text:
+        return text
+    out = _MD_HEADING_RE.sub("", text)
+    out = _MD_BOLD_RE.sub(r"\1", out)
+    out = _MD_ITALIC_RE.sub(r"\1", out)
+    # Bullet "- " yoki "* " boshlang'ich belgilarini "— " ga aylantiramiz
+    out = re.sub(r"(?m)^\s*[-*]\s+", "— ", out)
+    # Ortiqcha bo'sh qatorlarni qisqartiramiz
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
 
 def run_voice_profiler(audio_path: str):
     """Analyze voice prosody — runs locally via librosa, no network needed."""
