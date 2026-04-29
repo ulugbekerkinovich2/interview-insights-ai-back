@@ -464,8 +464,46 @@ def _build_user_prompt(query: str, chunks: List[Dict[str, Any]]) -> str:
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 FALLBACK_NO_CONTEXT = "Недостаточно данных для ответа на этот вопрос"
 
+# Suhbat tarixi — model oldingi savol-javoblarni "esda saqlashi" uchun
+# necha xabar yuboriladi (rol-based, sanitize qilingan, oxiridan).
+_HISTORY_MAX_MESSAGES = int(os.getenv("RAG_HISTORY_MAX", "10"))
 
-def ask_mistral(query: str, chunks: List[Dict[str, Any]], *, timeout: int = 45) -> str:
+
+def _build_history_messages(
+    history: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, str]]:
+    """Foydalanuvchi tomonidan yuborilgan tarixni Mistral messages formatiga
+    o'giradi. Har bir entry sanitize qilinadi va max ``_HISTORY_MAX_MESSAGES``
+    ga cheklanadi (oxiridan)."""
+    if not history:
+        return []
+    out: List[Dict[str, str]] = []
+    # Oxirgi N tasini olib, sanitize qilamiz
+    for msg in history[-_HISTORY_MAX_MESSAGES:]:
+        if not isinstance(msg, dict):
+            continue
+        role = (msg.get("role") or "").strip()
+        if role not in ("user", "assistant"):
+            continue
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        # User xabarlarini sanitize qilamiz (assistant — o'zimizdan, ammo
+        # defense-in-depth uchun ham tozalaymiz)
+        clean = _sanitize_rag_input(content)
+        if not clean:
+            continue
+        out.append({"role": role, "content": clean})
+    return out
+
+
+def ask_mistral(
+    query: str,
+    chunks: List[Dict[str, Any]],
+    *,
+    history: Optional[List[Dict[str, Any]]] = None,
+    timeout: int = 45,
+) -> str:
     api_key = os.getenv("MISTRAL_API_KEY", "").strip()
     if not api_key:
         return FALLBACK_NO_CONTEXT
@@ -476,6 +514,12 @@ def ask_mistral(query: str, chunks: List[Dict[str, Any]], *, timeout: int = 45) 
     # данных" qaytaradi.
 
     model = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+    history_msgs = _build_history_messages(history)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT_UZ},
+        *history_msgs,
+        {"role": "user", "content": _build_user_prompt(query, chunks)},
+    ]
     try:
         resp = requests.post(
             MISTRAL_API_URL,
@@ -484,10 +528,7 @@ def ask_mistral(query: str, chunks: List[Dict[str, Any]], *, timeout: int = 45) 
                 "model": model,
                 "temperature": float(os.getenv("RAG_TEMPERATURE", "0.2")),
                 "max_tokens": int(os.getenv("RAG_MAX_TOKENS", "1200")),
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT_UZ},
-                    {"role": "user", "content": _build_user_prompt(query, chunks)},
-                ],
+                "messages": messages,
             },
             timeout=timeout,
         )
@@ -498,7 +539,13 @@ def ask_mistral(query: str, chunks: List[Dict[str, Any]], *, timeout: int = 45) 
         return FALLBACK_NO_CONTEXT
 
 
-def ask_mistral_stream(query: str, chunks: List[Dict[str, Any]], *, timeout: int = 60):
+def ask_mistral_stream(
+    query: str,
+    chunks: List[Dict[str, Any]],
+    *,
+    history: Optional[List[Dict[str, Any]]] = None,
+    timeout: int = 60,
+):
     """Mistral API'dan token-by-token streaming javob. Generator yield qiladi:
     har element — qisman matn (delta). Xato yoki bo'sh holatda fallback string.
 
@@ -522,6 +569,12 @@ def ask_mistral_stream(query: str, chunks: List[Dict[str, Any]], *, timeout: int
     # chunks bo'sh bo'lsa ham streaming davom etadi — greeting/aniqlashtirish
 
     model = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+    history_msgs = _build_history_messages(history)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT_UZ},
+        *history_msgs,
+        {"role": "user", "content": _build_user_prompt(query, chunks)},
+    ]
     try:
         with requests.post(
             MISTRAL_API_URL,
@@ -535,10 +588,7 @@ def ask_mistral_stream(query: str, chunks: List[Dict[str, Any]], *, timeout: int
                 "temperature": float(os.getenv("RAG_TEMPERATURE", "0.2")),
                 "max_tokens": int(os.getenv("RAG_MAX_TOKENS", "1200")),
                 "stream": True,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT_UZ},
-                    {"role": "user", "content": _build_user_prompt(query, chunks)},
-                ],
+                "messages": messages,
             },
             timeout=timeout,
             stream=True,
@@ -614,6 +664,7 @@ def run_chat(
     top_k: int = 8,
     category: Optional[str] = None,
     language: Optional[str] = None,
+    history: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Role-aware RAG chat. Returns a dict suitable for ``KnowledgeChatResponse``.
 
@@ -636,13 +687,13 @@ def run_chat(
         )
         used_backend = "direct"
 
-    # Chunks bor bo'lsa LangChain'ni avval sinaymiz; chunks bo'sh bo'lsa darhol
-    # ask_mistral'ga o'tamiz — u greeting/aniqlashtirish prompti bilan chiqadi.
+    # Chunks bor bo'lsa LangChain'ni avval sinaymiz (history bo'lmaganda),
+    # aks holda darhol ask_mistral — u history qo'llab-quvvatlaydi.
     answer: Optional[str] = None
-    if chunks:
+    if chunks and not history:
         answer = _chat_via_langchain(query, chunks)
     if not answer:
-        answer = ask_mistral(query, chunks)
+        answer = ask_mistral(query, chunks, history=history)
     if not answer:
         answer = FALLBACK_NO_CONTEXT
     answer = _strip_injection_markers(answer)
@@ -712,6 +763,7 @@ def run_chat_stream(
     top_k: int = 8,
     category: Optional[str] = None,
     language: Optional[str] = None,
+    history: Optional[List[Dict[str, Any]]] = None,
 ):
     """Streaming RAG chat. Generator yield qiladi:
 
@@ -761,7 +813,7 @@ def run_chat_stream(
     pending_buf = ""  # marker boshi bo'lishi mumkin bo'lgan qisman matn
     MARKER_OPEN = "[SUSPECTED"
 
-    for delta in ask_mistral_stream(query, chunks):
+    for delta in ask_mistral_stream(query, chunks, history=history):
         if not delta:
             continue
         if delta == FALLBACK_NO_CONTEXT:

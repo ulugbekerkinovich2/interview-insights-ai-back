@@ -1172,7 +1172,15 @@ def chat_knowledge(
     # Default: RAG question
     import time as _time
     t0 = _time.time()
-    result = kb.run_chat(query, role=role, top_k=payload.top_k or int(os.getenv("RAG_DEFAULT_TOP_K", "8")))
+    history_payload = (
+        [m.model_dump() for m in payload.history] if payload.history else None
+    )
+    result = kb.run_chat(
+        query,
+        role=role,
+        top_k=payload.top_k or int(os.getenv("RAG_DEFAULT_TOP_K", "8")),
+        history=history_payload,
+    )
     latency_ms = int((_time.time() - t0) * 1000)
     _log_chat_query(db, user, query, result, latency_ms=latency_ms, streamed=False)
     return schemas.KnowledgeChatResponse(**result)
@@ -1225,7 +1233,15 @@ async def chat_knowledge_stream(
             # Generator sync, lekin biz har iteratsiyada disconnect tekshiramiz.
             # asyncio.to_thread orqali bloklash yo'q — sync gen'ni async'da o'rab,
             # disconnect bo'lsa break qilamiz (Mistral connection avtomatik yopiladi).
-            gen = kb.run_chat_stream(query, role=user_role, top_k=payload.top_k or int(os.getenv("RAG_DEFAULT_TOP_K", "8")))
+            history_payload = (
+                [m.model_dump() for m in payload.history] if payload.history else None
+            )
+            gen = kb.run_chat_stream(
+                query,
+                role=user_role,
+                top_k=payload.top_k or int(os.getenv("RAG_DEFAULT_TOP_K", "8")),
+                history=history_payload,
+            )
             for event in gen:
                 # Client disconnect tekshiruvi — har 50ms da ham bo'lsa cancel
                 if await request.is_disconnected():

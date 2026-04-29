@@ -171,9 +171,16 @@ class RetrainJobSchema(BaseModel):
         from_attributes = True
 
 
+class ChatHistoryMessage(BaseModel):
+    role: str = Field(..., pattern="^(user|assistant)$")
+    content: str = Field(..., min_length=1, max_length=4000)
+
+
 class KnowledgeChatRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=4000)
     top_k: Optional[int] = Field(default=5, ge=1, le=20)
+    # Oldingi xabarlar (kontekst). Backend faqat oxirgi 10 tasini ishlatadi.
+    history: Optional[List[ChatHistoryMessage]] = Field(default=None, max_length=40)
 
 
 class KnowledgeUsedChunk(BaseModel):
