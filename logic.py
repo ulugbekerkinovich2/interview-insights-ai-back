@@ -710,11 +710,13 @@ def build_interview_summary(answers: list) -> str:
         blocks.append(f"Q: {q}\nA: {a}\nAI: {ai}")
     
     full_text = "\n\n".join(blocks)
-    raw_output = run_rag_mistral(
-        "Make a summary of the interview. Briefly describe strengths, risks and overall conclusion.",
-        full_text
+    prompt = (
+        "Сделай итоговую сводку интервью на русском. Кратко опиши: "
+        "1) сильные стороны кандидата, 2) риски/слабости, 3) общий вывод (рекомендация).\n\n"
+        f"Данные интервью:\n{full_text}"
     )
-    return extract_mistral_answer(raw_output)
+    # _call_ai allaqachon AI_PROVIDER policy bo'yicha Mistral→Ollama fallback qiladi
+    return _call_ai(prompt).strip()
 
 def run_voice_profiler(audio_path: str):
     """Analyze voice prosody — runs locally via librosa, no network needed."""
