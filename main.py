@@ -722,16 +722,26 @@ async def startup():
     try:
         from sqlalchemy import text as _sa_text
         with database.engine.begin() as conn:
-            # display_id ustunini qo'shish — agar mavjud emas bo'lsa
+            # display_id ustunini qo'shish — agar mavjud emas bo'lsa.
+            # Yangi format YYYYMMLNNNN = 11 belgi.
             conn.execute(_sa_text(
-                "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS display_id VARCHAR(8)"
+                "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS display_id VARCHAR(11)"
             ))
+            # Eski o'rnatilishlarda VARCHAR(8) qolgan bo'lsa kengaytamiz —
+            # PostgreSQL ALTER COLUMN TYPE qisqartirmaydi, faqat kengaytmaydi.
+            try:
+                conn.execute(_sa_text(
+                    "ALTER TABLE candidates ALTER COLUMN display_id TYPE VARCHAR(11)"
+                ))
+            except Exception:
+                # Boshqa DB (SQLite) — type widening kerakmas / ishlamaydi
+                pass
             # Unique index — alohida statement (IF NOT EXISTS index uchun ishlaydi)
             conn.execute(_sa_text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_candidates_display_id "
                 "ON candidates(display_id)"
             ))
-        logger.info("Auto-migration: candidates.display_id ensured")
+        logger.info("Auto-migration: candidates.display_id ensured (VARCHAR(11))")
     except Exception as exc:
         # SQLite yoki boshqa DB'larda ALTER TABLE ADD COLUMN IF NOT EXISTS
         # ishlamasligi mumkin — shu holda alembic ishlatish tavsiya etiladi.
@@ -1367,35 +1377,58 @@ def read_candidate(candidate_id: int, db: Session = Depends(get_db), _: database
     return get_candidate_or_404(db, candidate_id)
 
 def _generate_display_id(db: Session, ts: Optional[datetime.datetime] = None) -> str:
-    """Kandidat uchun foydalanuvchi-do'st ID format: YYMMNNNN.
+    """Kandidat uchun foydalanuvchi-do'st ID format: YYYYMMLNNNN.
 
-    Misol: 26040001 — 2026-yil 04-oy 0001-nomzod (shu oy ichida).
-    NN qism shu oy ichidagi nomzodlar soni + 1 sifatida hisoblanadi.
+    Tarkibi (jami 11 belgi):
+      - YYYY — 4 raqamli yil (2026)
+      - MM   — 2 raqamli oy (04)
+      - L    — 1 ta katta harf A-Z (A, keyin to'lgach B, va h.k.)
+      - NNNN — 4 raqamli ketma-ketlik 0001..9999 shu (yil, oy, harf) bo'limida
 
-    Race condition'dan himoya: SQLAlchemy unique constraint + retry. Ehtimol
-    bo'lmagan bir vaqtda 2 ta nomzod yaratilsa, IntegrityError tushadi va
-    retry'da yangi raqam olinadi.
+    Misol: 202604A0001 — 2026-yil 04-oy, "A" guruhi, 1-nomzod.
+    A-guruhi 9999 ga yetganda B'ga o'tiladi, B → C va h.k.
+
+    Race condition'dan himoya: SQLAlchemy unique constraint + retry. Bir
+    vaqtda 2 ta nomzod yaratilsa, IntegrityError tushadi va retry'da yangi
+    raqam olinadi.
     """
     if ts is None:
         ts = datetime.datetime.utcnow()
-    yy = ts.strftime("%y")  # 26
-    mm = ts.strftime("%m")  # 04
-    prefix = f"{yy}{mm}"
+    yyyy = ts.strftime("%Y")  # 2026
+    mm = ts.strftime("%m")    # 04
+    ym_prefix = f"{yyyy}{mm}"  # YYYYMM (6 belgi)
 
-    # Shu oyda mavjud eng katta display_id ni topib, +1 qaytaramiz
+    # Shu oyda mavjud eng katta display_id ni topib, undan keyingisini hisoblaymiz.
     last = (
         db.query(database.Candidate.display_id)
-        .filter(database.Candidate.display_id.like(f"{prefix}%"))
+        .filter(database.Candidate.display_id.like(f"{ym_prefix}%"))
         .order_by(database.Candidate.display_id.desc())
         .first()
     )
+    letter = "A"
     next_seq = 1
-    if last and last[0]:
+    if last and last[0] and len(last[0]) >= 11:
         try:
-            next_seq = int(last[0][4:]) + 1
+            last_letter = last[0][6]
+            last_seq = int(last[0][7:11])
+            if last_seq < 9999:
+                letter = last_letter
+                next_seq = last_seq + 1
+            elif last_letter < "Z":
+                # Harfdan keyingisiga o'tamiz, raqam 0001'dan boshlanadi
+                letter = chr(ord(last_letter) + 1)
+                next_seq = 1
+            else:
+                # Z9999 — bu oyda quvvat tugadi (260000 ta nomzod)
+                # Bu juda kam ehtimol; har ehtimolga qarshi shu format'da
+                # qoldiramiz va unique constraint xatosini chaqirishga
+                # ruxsat beramiz (retry endpointi handle qiladi).
+                letter = "Z"
+                next_seq = 9999
         except (ValueError, IndexError):
+            letter = "A"
             next_seq = 1
-    return f"{prefix}{next_seq:04d}"
+    return f"{ym_prefix}{letter}{next_seq:04d}"
 
 
 @app.post("/candidates/", response_model=schemas.CandidateCreateResponse)

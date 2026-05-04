@@ -78,10 +78,13 @@ class Candidate(Base):
     status = Column(String, default="In Progress")
     access_code = Column(String, unique=True, index=True, nullable=True) # Will store secure 16-char token
     pin_hash = Column(String, nullable=True) # Hashed 6-digit PIN
-    # User-friendly ID format: YYMMNNNN (masalan 26040001 — 2026-yil 04-oy 0001-nomzod)
-    # Yaratilish paytida avtomatik generatsiya qilinadi (oy boshida 0001'dan).
+    # User-friendly ID format: YYYYMMLNNNN (11 belgi)
+    # Misol: 202604A0001 — 2026-yil 04-oy A-guruh 0001-nomzod
+    # A-guruh 9999 ga to'lgach B'ga o'tadi, va h.k. A-Z gacha (oy ichida ~260K).
     # Eski yozuvlar uchun nullable; lazy backfill create_candidate'da bajariladi.
-    display_id = Column(String(8), unique=True, index=True, nullable=True)
+    # Eski 8-belgili formatdagi yozuvlar ham mosligicha qoladi (length 11
+    # ularni ham sig'diradi).
+    display_id = Column(String(11), unique=True, index=True, nullable=True)
     # User o'chirilsa — nomzodlar qoladi lekin owner_id NULL ga o'rnatiladi
     # (audit saqlaydi, lekin ma'lumot yo'qolmaydi)
     owner_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
