@@ -1,3 +1,4 @@
+import datetime
 from pydantic import BaseModel, Field
 from typing import List, Optional, Any, Dict
 
@@ -181,6 +182,56 @@ class KnowledgeChatRequest(BaseModel):
     top_k: Optional[int] = Field(default=5, ge=1, le=20)
     # Oldingi xabarlar (kontekst). Backend faqat oxirgi 10 tasini ishlatadi.
     history: Optional[List[ChatHistoryMessage]] = Field(default=None, max_length=40)
+    # Server-side sessiya identifikatori. Berilsa, xabar shu sessiyaga
+    # saqlanadi va updated_at yangilanadi. Berilmasa — xabar saqlanmaydi
+    # (faqat client-side history orqali ishlaydi).
+    session_id: Optional[int] = Field(default=None, ge=1)
+
+
+# === Chat sessions (server-side history) ===
+
+class ChatSessionCreate(BaseModel):
+    title: Optional[str] = Field(default=None, max_length=255)
+
+
+class ChatSessionUpdate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=255)
+
+
+class ChatSessionMessageOut(BaseModel):
+    id: int
+    role: str
+    content: str
+    confidence: Optional[int] = None
+    sources: Optional[Any] = None
+    cited_indices: Optional[List[int]] = None
+    created_at: datetime.datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ChatSessionOut(BaseModel):
+    id: int
+    title: str
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
+    message_count: int = 0
+    last_message_preview: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ChatSessionDetail(BaseModel):
+    id: int
+    title: str
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
+    messages: List[ChatSessionMessageOut] = []
+
+    class Config:
+        from_attributes = True
 
 
 class KnowledgeUsedChunk(BaseModel):

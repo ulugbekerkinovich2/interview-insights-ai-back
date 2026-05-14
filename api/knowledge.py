@@ -1183,6 +1183,23 @@ def chat_knowledge(
     )
     latency_ms = int((_time.time() - t0) * 1000)
     _log_chat_query(db, user, query, result, latency_ms=latency_ms, streamed=False)
+
+    # Sessiyaga ham saqlash (server-side history sidebar uchun)
+    if payload.session_id:
+        try:
+            _save_chat_message(db, payload.session_id, user.id, "user", query)
+            _save_chat_message(
+                db,
+                payload.session_id,
+                user.id,
+                "assistant",
+                result.get("answer", ""),
+                confidence=result.get("confidence"),
+                sources=result.get("sources"),
+                cited_indices=result.get("cited_indices"),
+            )
+        except Exception as exc:
+            logger.warning("chat session save skipped: %s", exc)
     return schemas.KnowledgeChatResponse(**result)
 
 
@@ -1288,6 +1305,23 @@ async def chat_knowledge_stream(
                     streamed=True,
                     error="cancelled_by_client" if cancelled else None,
                 )
+                # Sessiyaga ham saqlash (server-side history sidebar uchun)
+                if payload.session_id:
+                    try:
+                        final_answer = done_payload.get("answer") or "".join(full_answer_parts)
+                        _save_chat_message(db_session, payload.session_id, user_id, "user", query)
+                        _save_chat_message(
+                            db_session,
+                            payload.session_id,
+                            user_id,
+                            "assistant",
+                            final_answer,
+                            confidence=_conf,
+                            sources=done_payload.get("sources"),
+                            cited_indices=done_payload.get("cited_indices"),
+                        )
+                    except Exception as exc:
+                        logger.warning("chat stream session save skipped: %s", exc)
             finally:
                 db_session.close()
         except Exception as exc:
@@ -1372,6 +1406,211 @@ def _log_chat_query(
         latency_ms=latency_ms,
         streamed=streamed,
     )
+
+
+# =============================================================================
+# Chat sessions — server-side history (ChatGPT-style, per-user)
+# =============================================================================
+
+
+def _session_title_from_query(query: str) -> str:
+    """Birinchi user xabaridan max 7 so'z (50 belgi) sarlavha chiqaradi."""
+    text = (query or "").strip().replace("\n", " ")
+    if not text:
+        return "Новый чат"
+    words = text.split()[:7]
+    joined = " ".join(words)
+    return (joined[:50] + "…") if len(joined) > 50 else joined
+
+
+def _save_chat_message(
+    db: Session,
+    session_id: int,
+    user_id: int,
+    role: str,
+    content: str,
+    *,
+    confidence: Optional[float] = None,
+    sources: Optional[List[Dict[str, Any]]] = None,
+    cited_indices: Optional[List[int]] = None,
+) -> None:
+    """Sessiyaga xabar qo'shadi va updated_at'ni yangilaydi.
+
+    user_id parametri xavfsizlik tekshiruvi uchun — sessiya boshqa user'niki
+    bo'lsa xabar saqlanmaydi (logger.warning bilan o'tkazib yuboradi).
+    """
+    sess = (
+        db.query(database.ChatSession)
+        .filter(database.ChatSession.id == session_id, database.ChatSession.user_id == user_id)
+        .first()
+    )
+    if not sess:
+        logger.warning("save_chat_message: session %s not found or not owned by user %s", session_id, user_id)
+        return
+    msg = database.ChatSessionMessage(
+        session_id=session_id,
+        role=role,
+        content=content,
+        confidence=int(round(confidence)) if confidence is not None else None,
+        sources=sources,
+        cited_indices=cited_indices,
+    )
+    db.add(msg)
+    # updated_at'ni yangilaymiz va birinchi user xabaridan title chiqaramiz
+    sess.updated_at = datetime.datetime.utcnow()
+    if role == "user" and sess.title == "Новый чат":
+        sess.title = _session_title_from_query(content)
+    db.commit()
+
+
+@router.get("/chat/sessions", response_model=List[schemas.ChatSessionOut])
+def list_chat_sessions(
+    db: Session = Depends(_get_db),
+    user: database.User = Depends(_require_authenticated),
+):
+    """Foydalanuvchining barcha sessiyalari, eng yangisi tepada."""
+    sessions = (
+        db.query(database.ChatSession)
+        .filter(database.ChatSession.user_id == user.id)
+        .order_by(database.ChatSession.updated_at.desc())
+        .all()
+    )
+    result = []
+    for s in sessions:
+        last_msg = (
+            db.query(database.ChatSessionMessage)
+            .filter(database.ChatSessionMessage.session_id == s.id)
+            .order_by(database.ChatSessionMessage.created_at.desc())
+            .first()
+        )
+        count = (
+            db.query(database.ChatSessionMessage)
+            .filter(database.ChatSessionMessage.session_id == s.id)
+            .count()
+        )
+        preview = (last_msg.content[:80] if last_msg else None)
+        result.append(
+            schemas.ChatSessionOut(
+                id=s.id,
+                title=s.title,
+                created_at=s.created_at,
+                updated_at=s.updated_at,
+                message_count=count,
+                last_message_preview=preview,
+            )
+        )
+    return result
+
+
+@router.post("/chat/sessions", response_model=schemas.ChatSessionOut)
+def create_chat_session(
+    payload: schemas.ChatSessionCreate,
+    db: Session = Depends(_get_db),
+    user: database.User = Depends(_require_authenticated),
+):
+    """Yangi sessiya yaratadi. Title bo'lmasa "Новый чат"."""
+    sess = database.ChatSession(
+        user_id=user.id,
+        title=(payload.title or "").strip() or "Новый чат",
+    )
+    db.add(sess)
+    db.commit()
+    db.refresh(sess)
+    return schemas.ChatSessionOut(
+        id=sess.id,
+        title=sess.title,
+        created_at=sess.created_at,
+        updated_at=sess.updated_at,
+        message_count=0,
+        last_message_preview=None,
+    )
+
+
+@router.get("/chat/sessions/{session_id}", response_model=schemas.ChatSessionDetail)
+def get_chat_session(
+    session_id: int,
+    db: Session = Depends(_get_db),
+    user: database.User = Depends(_require_authenticated),
+):
+    """Sessiya tafsiloti — barcha xabarlari bilan (vaqt bo'yicha sortlangan)."""
+    sess = (
+        db.query(database.ChatSession)
+        .filter(database.ChatSession.id == session_id, database.ChatSession.user_id == user.id)
+        .first()
+    )
+    if not sess:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+    messages = (
+        db.query(database.ChatSessionMessage)
+        .filter(database.ChatSessionMessage.session_id == session_id)
+        .order_by(database.ChatSessionMessage.created_at.asc(), database.ChatSessionMessage.id.asc())
+        .all()
+    )
+    return schemas.ChatSessionDetail(
+        id=sess.id,
+        title=sess.title,
+        created_at=sess.created_at,
+        updated_at=sess.updated_at,
+        messages=[
+            schemas.ChatSessionMessageOut(
+                id=m.id,
+                role=m.role,
+                content=m.content,
+                confidence=m.confidence,
+                sources=m.sources,
+                cited_indices=m.cited_indices or [],
+                created_at=m.created_at,
+            )
+            for m in messages
+        ],
+    )
+
+
+@router.patch("/chat/sessions/{session_id}", response_model=schemas.ChatSessionOut)
+def update_chat_session(
+    session_id: int,
+    payload: schemas.ChatSessionUpdate,
+    db: Session = Depends(_get_db),
+    user: database.User = Depends(_require_authenticated),
+):
+    """Sessiya sarlavhasini yangilash (qo'lda rename)."""
+    sess = (
+        db.query(database.ChatSession)
+        .filter(database.ChatSession.id == session_id, database.ChatSession.user_id == user.id)
+        .first()
+    )
+    if not sess:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+    sess.title = payload.title.strip()
+    db.commit()
+    db.refresh(sess)
+    return schemas.ChatSessionOut(
+        id=sess.id,
+        title=sess.title,
+        created_at=sess.created_at,
+        updated_at=sess.updated_at,
+        message_count=0,
+        last_message_preview=None,
+    )
+
+
+@router.delete("/chat/sessions/{session_id}")
+def delete_chat_session(
+    session_id: int,
+    db: Session = Depends(_get_db),
+    user: database.User = Depends(_require_authenticated),
+):
+    """Sessiyani va barcha xabarlarini o'chiradi (CASCADE)."""
+    sess = (
+        db.query(database.ChatSession)
+        .filter(database.ChatSession.id == session_id, database.ChatSession.user_id == user.id)
+        .first()
+    )
+    if not sess:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+    db.delete(sess)
+    db.commit()
+    return {"status": "deleted"}
 
 
 # =============================================================================

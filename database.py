@@ -167,6 +167,42 @@ class RetrainJob(Base):
     error = Column(Text, nullable=True)
 
 
+class ChatSession(Base):
+    """Foydalanuvchi chat sessiyasi — ChatGPT'dagi suhbat thread analogi.
+
+    Har user uchun bir nechta sessiya bo'lishi mumkin (sidebar'da ro'yxat).
+    title — birinchi user xabaridan avtomatik chiqariladi yoki qo'lda
+    o'zgartiriladi. updated_at — yangi xabar qo'shilganda yangilanadi
+    (sidebar'da eng yangisi yuqorida bo'lishi uchun).
+    """
+    __tablename__ = "chat_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String(255), default="Новый чат")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, index=True)
+
+
+class ChatSessionMessage(Base):
+    """Sessiya ichidagi alohida xabar (user yoki assistant).
+
+    Har xabar ChatSession bilan FK orqali bog'langan. Sessiya o'chirilsa
+    barcha xabarlari ham CASCADE bilan o'chadi. sources/cited_indices —
+    assistant javoblari uchun ishlatiladi (RAG metadata).
+    """
+    __tablename__ = "chat_session_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    role = Column(String(20), nullable=False)  # "user" | "assistant"
+    content = Column(Text, nullable=False)
+    confidence = Column(Integer, nullable=True)  # 0-100, faqat assistant
+    sources = Column(JSON, nullable=True)        # [{ index, doc_id, title }, ...]
+    cited_indices = Column(JSON, nullable=True)  # [1, 2, 3]
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+
 class ChatQueryLog(Base):
     """Psixologik chat query'larining audit logi.
 
