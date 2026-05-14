@@ -194,17 +194,31 @@ class SalaryGrade(Base):
 
 
 class UserSalaryProfile(Base):
-    """Foydalanuvchi (psixolog/recruiter)'ning maosh profili.
+    """Foydalanuvchi (psixolog)'ning to'liq profili.
 
     Birinchi login'da majburiy onboarding orqali to'ldiriladi. Lavozim va
-    daraja SalaryGrade'dagi kombinatsiyaga ishora qiladi — bazaviy maosh
-    o'sha yerda saqlanadi (one source of truth).
+    daraja SalaryGrade'dagi kombinatsiyaga ishora qiladi (bazaviy maosh
+    o'sha yerda saqlanadi). Shaxsiy va kasbiy ma'lumotlar ham shu yerda —
+    SuperAdmin keyinchalik hisobot uchun ko'ra oladi.
     """
     __tablename__ = "user_salary_profiles"
 
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     salary_grade_id = Column(Integer, ForeignKey("salary_grades.id", ondelete="SET NULL"), nullable=True, index=True)
     onboarding_completed = Column(Boolean, default=False, index=True)
+
+    # === Shaxsiy ma'lumotlar ===
+    phone = Column(String(32), nullable=True)
+    date_of_birth = Column(String(20), nullable=True)   # ISO YYYY-MM-DD
+    gender = Column(String(10), nullable=True)          # "male" | "female"
+    city = Column(String(100), nullable=True)
+
+    # === Kasbiy ma'lumotlar ===
+    specialization = Column(String(200), nullable=True)  # masalan "Семейный психолог"
+    years_of_experience = Column(Integer, nullable=True)
+    education = Column(Text, nullable=True)              # vuz + yil (multi-line)
+    bio = Column(Text, nullable=True)                    # o'zi haqida qisqacha
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 

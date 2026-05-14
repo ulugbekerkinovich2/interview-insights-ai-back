@@ -96,6 +96,16 @@ class SalaryGradeOut(BaseModel):
 
 class SalaryProfileIn(BaseModel):
     salary_grade_id: int = Field(..., gt=0)
+    # Shaxsiy ma'lumotlar (onboarding'da to'ldiriladi)
+    phone: Optional[str] = Field(default=None, max_length=32)
+    date_of_birth: Optional[str] = Field(default=None, max_length=20)  # YYYY-MM-DD
+    gender: Optional[str] = Field(default=None, pattern="^(male|female)$")
+    city: Optional[str] = Field(default=None, max_length=100)
+    # Kasbiy ma'lumotlar
+    specialization: Optional[str] = Field(default=None, max_length=200)
+    years_of_experience: Optional[int] = Field(default=None, ge=0, le=70)
+    education: Optional[str] = Field(default=None, max_length=2000)
+    bio: Optional[str] = Field(default=None, max_length=2000)
 
 
 class SalaryProfileOut(BaseModel):
@@ -105,6 +115,16 @@ class SalaryProfileOut(BaseModel):
     position: Optional[str] = None
     degree: Optional[str] = None
     base_salary: Optional[int] = None
+    # Shaxsiy
+    phone: Optional[str] = None
+    date_of_birth: Optional[str] = None
+    gender: Optional[str] = None
+    city: Optional[str] = None
+    # Kasbiy
+    specialization: Optional[str] = None
+    years_of_experience: Optional[int] = None
+    education: Optional[str] = None
+    bio: Optional[str] = None
 
 
 class SalaryCurrent(BaseModel):
@@ -285,6 +305,14 @@ def _profile_response(db: Session, prof: database.UserSalaryProfile) -> SalaryPr
         position=grade.position if grade else None,
         degree=grade.degree if grade else None,
         base_salary=grade.base_salary if grade else None,
+        phone=prof.phone,
+        date_of_birth=prof.date_of_birth,
+        gender=prof.gender,
+        city=prof.city,
+        specialization=prof.specialization,
+        years_of_experience=prof.years_of_experience,
+        education=prof.education,
+        bio=prof.bio,
     )
 
 
@@ -305,13 +333,33 @@ def set_my_profile(
     db: Session = Depends(_get_db),
     user: database.User = Depends(_require_authenticated),
 ):
-    """Onboarding: lavozim va darajani tanlash. Bir martalik majburiy qadam."""
+    """Onboarding: lavozim, daraja va shaxsiy/kasbiy ma'lumotlar."""
     grade = db.query(database.SalaryGrade).filter_by(id=payload.salary_grade_id).first()
     if not grade:
-        raise HTTPException(status_code=404, detail="Лавозим топилмади")
+        raise HTTPException(status_code=404, detail="Должность не найдена")
     prof = _get_or_create_profile(db, user.id)
     prof.salary_grade_id = grade.id
     prof.onboarding_completed = True
+
+    # Shaxsiy
+    if payload.phone is not None:
+        prof.phone = payload.phone.strip() or None
+    if payload.date_of_birth is not None:
+        prof.date_of_birth = payload.date_of_birth.strip() or None
+    if payload.gender is not None:
+        prof.gender = payload.gender.strip() or None
+    if payload.city is not None:
+        prof.city = payload.city.strip() or None
+    # Kasbiy
+    if payload.specialization is not None:
+        prof.specialization = payload.specialization.strip() or None
+    if payload.years_of_experience is not None:
+        prof.years_of_experience = payload.years_of_experience
+    if payload.education is not None:
+        prof.education = payload.education.strip() or None
+    if payload.bio is not None:
+        prof.bio = payload.bio.strip() or None
+
     db.commit()
     db.refresh(prof)
     return _profile_response(db, prof)

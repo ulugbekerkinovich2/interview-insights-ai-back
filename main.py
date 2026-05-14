@@ -751,7 +751,25 @@ async def startup():
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_candidates_display_id "
                 "ON candidates(display_id)"
             ))
-        logger.info("Auto-migration: candidates.display_id ensured (VARCHAR(11))")
+
+            # user_salary_profiles — shaxsiy va kasbiy ma'lumotlar uchun
+            # yangi ustunlar (eski deploylar uchun lazy migration).
+            for ddl in [
+                "ALTER TABLE user_salary_profiles ADD COLUMN IF NOT EXISTS phone VARCHAR(32)",
+                "ALTER TABLE user_salary_profiles ADD COLUMN IF NOT EXISTS date_of_birth VARCHAR(20)",
+                "ALTER TABLE user_salary_profiles ADD COLUMN IF NOT EXISTS gender VARCHAR(10)",
+                "ALTER TABLE user_salary_profiles ADD COLUMN IF NOT EXISTS city VARCHAR(100)",
+                "ALTER TABLE user_salary_profiles ADD COLUMN IF NOT EXISTS specialization VARCHAR(200)",
+                "ALTER TABLE user_salary_profiles ADD COLUMN IF NOT EXISTS years_of_experience INTEGER",
+                "ALTER TABLE user_salary_profiles ADD COLUMN IF NOT EXISTS education TEXT",
+                "ALTER TABLE user_salary_profiles ADD COLUMN IF NOT EXISTS bio TEXT",
+            ]:
+                try:
+                    conn.execute(_sa_text(ddl))
+                except Exception:
+                    # SQLite yoki jadval hali yaratilmagan — create_all qo'shadi
+                    pass
+        logger.info("Auto-migration: candidates.display_id + user_salary_profiles columns ensured")
     except Exception as exc:
         # SQLite yoki boshqa DB'larda ALTER TABLE ADD COLUMN IF NOT EXISTS
         # ishlamasligi mumkin — shu holda alembic ishlatish tavsiya etiladi.
