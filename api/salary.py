@@ -476,33 +476,87 @@ def list_user_snapshots(
 # === Seed function ==========================================================
 
 SEED_GRADES = [
-    ("Kafedra mudiri", "Fan doktori / Professor", 14_146_482),
-    ("Kafedra mudiri", "Ph.D / Dotsent", 13_271_444),
-    ("Kafedra mudiri", "Darajasiz", 11_703_662),
-    ("Professor", "Fan doktori + Professor unvoni", 13_490_202),
-    ("Professor", "Ph.D + Dotsent unvoni", 12_688_082),
-    ("Professor", "Fan doktori yoki Professor", 12_104_722),
-    ("Dotsent", "Fan doktori / Professor", 11_411_983),
-    ("Dotsent", "Ph.D / Dotsent", 10_682_784),
-    ("Dotsent", "Darajasiz", 9_552_521),
-    ("Katta o'qituvchi", "Daraja va unvon", 9_953_583),
-    ("Katta o'qituvchi", "Daraja yoki unvon", 9_370_224),
-    ("Katta o'qituvchi", "Darajasiz", 8_568_102),
-    ("Assistent", "Daraja va unvon", 8_786_864),
-    ("Assistent", "Daraja yoki unvon", 8_203_501),
-    ("Assistent", "Darajasiz", 7_620_142),
-    ("O'qituvchi-stajyor", "—", 6_745_101),
+    # (position, degree, base_salary)
+    ("Заведующий кафедрой", "Доктор наук / Профессор", 14_146_482),
+    ("Заведующий кафедрой", "Ph.D / Доцент", 13_271_444),
+    ("Заведующий кафедрой", "Без степени", 11_703_662),
+    ("Профессор", "Доктор наук + звание профессора", 13_490_202),
+    ("Профессор", "Ph.D + звание доцента", 12_688_082),
+    ("Профессор", "Доктор наук или Профессор", 12_104_722),
+    ("Доцент", "Доктор наук / Профессор", 11_411_983),
+    ("Доцент", "Ph.D / Доцент", 10_682_784),
+    ("Доцент", "Без степени", 9_552_521),
+    ("Старший преподаватель", "Степень и звание", 9_953_583),
+    ("Старший преподаватель", "Степень или звание", 9_370_224),
+    ("Старший преподаватель", "Без степени", 8_568_102),
+    ("Ассистент", "Степень и звание", 8_786_864),
+    ("Ассистент", "Степень или звание", 8_203_501),
+    ("Ассистент", "Без степени", 7_620_142),
+    ("Преподаватель-стажёр", "—", 6_745_101),
 ]
+
+# Eski Uzbek nomlardan yangi Russian nomlarga moslik (production'da
+# saqlangan eski yozuvlarni ko'chirish uchun bir martalik migration).
+_UZ_TO_RU_MIGRATION = {
+    # position eski → yangi
+    "positions": {
+        "Kafedra mudiri": "Заведующий кафедрой",
+        "Professor": "Профессор",
+        "Dotsent": "Доцент",
+        "Katta o'qituvchi": "Старший преподаватель",
+        "Assistent": "Ассистент",
+        "O'qituvchi-stajyor": "Преподаватель-стажёр",
+    },
+    # degree eski → yangi
+    "degrees": {
+        "Fan doktori / Professor": "Доктор наук / Профессор",
+        "Ph.D / Dotsent": "Ph.D / Доцент",
+        "Darajasiz": "Без степени",
+        "Fan doktori + Professor unvoni": "Доктор наук + звание профессора",
+        "Ph.D + Dotsent unvoni": "Ph.D + звание доцента",
+        "Fan doktori yoki Professor": "Доктор наук или Профессор",
+        "Daraja va unvon": "Степень и звание",
+        "Daraja yoki unvon": "Степень или звание",
+    },
+}
+
+
+def _migrate_uz_to_ru(db: Session) -> int:
+    """Eski Uzbek yozuvlarini Russian'ga ko'chiradi (idempotent).
+    Return: yangilangan yozuvlar soni."""
+    updated = 0
+    grades = db.query(database.SalaryGrade).all()
+    for g in grades:
+        new_pos = _UZ_TO_RU_MIGRATION["positions"].get(g.position, g.position)
+        new_deg = _UZ_TO_RU_MIGRATION["degrees"].get(g.degree, g.degree)
+        if new_pos != g.position or new_deg != g.degree:
+            g.position = new_pos
+            g.degree = new_deg
+            updated += 1
+    if updated:
+        try:
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            logger.warning("uz→ru migration commit failed: %s", exc)
+            return 0
+    return updated
 
 
 def seed_salary_grades(db: Session) -> int:
-    """Jadval bo'sh bo'lsa 16 yozuvni qo'shadi. Return: qo'shilgan soni."""
+    """Jadval bo'sh bo'lsa 16 yozuvni qo'shadi.
+    Mavjud Uzbek yozuvlarini Russian'ga ko'chiradi (idempotent).
+    Return: qo'shilgan + ko'chirilgan soni."""
     existing = db.query(database.SalaryGrade).count()
-    if existing > 0:
-        return 0
-    for position, degree, base_salary in SEED_GRADES:
-        db.add(
-            database.SalaryGrade(position=position, degree=degree, base_salary=base_salary)
-        )
-    db.commit()
-    return len(SEED_GRADES)
+    if existing == 0:
+        for position, degree, base_salary in SEED_GRADES:
+            db.add(
+                database.SalaryGrade(position=position, degree=degree, base_salary=base_salary)
+            )
+        db.commit()
+        return len(SEED_GRADES)
+    # Jadval bo'sh emas — eski Uzbek nomlarini Russian'ga aylantiramiz
+    migrated = _migrate_uz_to_ru(db)
+    if migrated > 0:
+        logger.info("Migrated %d salary grade names from Uzbek to Russian", migrated)
+    return migrated
