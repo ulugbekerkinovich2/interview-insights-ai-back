@@ -59,6 +59,7 @@ import database
 import schemas
 import logic
 from api.knowledge import router as knowledge_router
+from api.salary import router as salary_router, seed_salary_grades as _seed_salary_grades
 from utils.executor import (
     stt_executor, llm_executor, frame_executor, run_bounded, QueueFull, pool_stats,
     shutdown_all as _shutdown_executors,
@@ -683,6 +684,7 @@ async def limit_request_body(request: Request, call_next):
 
 # Role-based RAG knowledge-base API (/knowledge/*).
 app.include_router(knowledge_router)
+app.include_router(salary_router)
 
 # app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media") # Unsecured mount removed
 
@@ -766,6 +768,13 @@ async def startup():
                 logger.info(f"Stale Celery jobs cleaned: {len(stale)}")
     except Exception as exc:
         logger.warning(f"stale-jobs cleanup skipped: {exc}")
+
+    # Salary grades seed — startup'da jadval bo'sh bo'lsa 16 ta yozuv qo'shamiz
+    try:
+        with SessionLocal() as db:
+            _seed_salary_grades(db)
+    except Exception as exc:
+        logger.warning(f"salary grades seed skipped: {exc}")
 
     # Whisper idle TTL eviction — har 60 sekund tekshiradi, foydalanilmagan
     # modelni xotiradan bo'shatadi. Server tugasa task ham tugaydi.

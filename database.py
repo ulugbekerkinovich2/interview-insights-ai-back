@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String, Text, Boolean, create_engine, text
+from sqlalchemy import JSON, Column, DateTime, Float, ForeignKey, Integer, String, Text, Boolean, UniqueConstraint, create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 
@@ -165,6 +165,75 @@ class RetrainJob(Base):
     current_doc_id = Column(Integer, nullable=True)
     failed_ids = Column(JSON, default=list)
     error = Column(Text, nullable=True)
+
+
+class SalaryGrade(Base):
+    """Lavozim x daraja kombinatsiyasi bo'yicha bazaviy maosh.
+
+    SuperAdmin tahrirlaydi. Startup'da 16 ta yozuv avtomatik seed qilinadi
+    (universitet o'qituvchilarining standart jadvalisi). Yangi kombinatsiyalar
+    qo'shilishi mumkin.
+
+    Maosh formulasi:
+        hourly_rate = base_salary / 22 / 8
+        monthly_salary = hourly_rate * hours_worked * (hours_worked / 176)
+                       = base_salary / 22 / 8 * hours_worked * hours_worked / 176
+    """
+    __tablename__ = "salary_grades"
+
+    id = Column(Integer, primary_key=True, index=True)
+    position = Column(String(100), nullable=False)   # "Kafedra mudiri", "Professor", ...
+    degree = Column(String(150), nullable=False)     # "Fan doktori / Professor", ...
+    base_salary = Column(Integer, nullable=False)    # so'mda (masalan 14146482)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("position", "degree", name="uq_salary_grade_position_degree"),
+    )
+
+
+class UserSalaryProfile(Base):
+    """Foydalanuvchi (psixolog/recruiter)'ning maosh profili.
+
+    Birinchi login'da majburiy onboarding orqali to'ldiriladi. Lavozim va
+    daraja SalaryGrade'dagi kombinatsiyaga ishora qiladi — bazaviy maosh
+    o'sha yerda saqlanadi (one source of truth).
+    """
+    __tablename__ = "user_salary_profiles"
+
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    salary_grade_id = Column(Integer, ForeignKey("salary_grades.id", ondelete="SET NULL"), nullable=True, index=True)
+    onboarding_completed = Column(Boolean, default=False, index=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
+class SalarySnapshot(Base):
+    """Har oy uchun maosh snapshot — audit va tarix uchun.
+
+    SuperAdmin "Hisobla" tugmasini bosganda yaratiladi yoki cron orqali oy
+    oxirida avtomatik. Bir user — bir oy — bir snapshot (unique constraint).
+    """
+    __tablename__ = "salary_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    year = Column(Integer, nullable=False, index=True)
+    month = Column(Integer, nullable=False)  # 1-12
+    # Snapshot momentidagi qiymatlar (keyin grade o'zgarsa ham bu yerda saqlanadi)
+    position = Column(String(100), nullable=False)
+    degree = Column(String(150), nullable=False)
+    base_salary = Column(Integer, nullable=False)
+    hours_worked = Column(Float, nullable=False, default=0.0)
+    hourly_rate = Column(Float, nullable=False, default=0.0)
+    percentage = Column(Float, nullable=False, default=0.0)   # 0-100
+    monthly_salary = Column(Float, nullable=False, default=0.0)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "year", "month", name="uq_salary_snapshot_user_month"),
+    )
 
 
 class ChatSession(Base):
