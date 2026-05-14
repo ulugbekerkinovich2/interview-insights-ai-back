@@ -691,8 +691,16 @@ app.include_router(salary_router)
 
 @app.on_event("startup")
 async def startup():
-    if database.DATABASE_URL.startswith("sqlite"):
+    # init_db() = Base.metadata.create_all() — barcha jadvallarni yaratish
+    # (idempotent: mavjudlarini tegmaydi, faqat YO'Q bo'lganlarini qo'shadi).
+    # Avval faqat SQLite uchun chaqirilardi va Postgres'ga yangi modellar
+    # yetib bormasdi (alembic ishlatish kerak edi). Endi Postgres'ga ham
+    # chaqiramiz — yangi jadvallar (chat_sessions, salary_*, ...) avtomatik
+    # paydo bo'ladi.
+    try:
         database.init_db()
+    except Exception as exc:
+        logger.warning(f"init_db skipped: {exc}")
 
     # Capture the running event loop so sync handlers can schedule
     # per-user WebSocket pushes via ``NotificationHub``.
