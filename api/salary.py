@@ -11,10 +11,16 @@ Formula (universitet o'qituvchilari + data hajmi):
     percentage     = volume_ratio * 100
     monthly_salary = hourly_rate * hours_worked * volume_ratio
 
-Sarflangan soat avtomatik intervyu sessiyalaridan hisoblanadi
-(candidates.answers[].duration_sec yig'indisi, oy bo'yicha).
-Kiritilgan hajm (MB) — user'ning chat_session_messages ichida role='user'
-xabarlari OCTET_LENGTH yig'indisi (oy bo'yicha) / 1048576.
+Hisob faqat HAQIQIY PSIXOLOGIK chat'dan olinadi (chat_query_logs jadvali).
+Oddiy yozishmalar (boshqa chat sessiyalari yoki kandidat intervyulari) hisobga
+olinmaydi.
+
+  • MB    = SUM(OCTET_LENGTH(query)) / 1048576 — user'ning psixologik
+            so'rovlari hajmi (error IS NULL).
+  • Hours = psixologik so'rovlar orasidagi vaqt yig'indisi, 30 daqiqalik
+            tanaffus bilan sessiyalarga ajratiladi (har sessiya
+            max 2 soat bilan cheklanadi, sessiyaning o'zi >0 bo'lsa min 5
+            daqiqa hisoblanadi).
 """
 from __future__ import annotations
 
@@ -23,7 +29,7 @@ import logging
 import os
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field
@@ -189,82 +195,104 @@ def calculate_salary(base_salary: int, hours_worked: float, mb_input: float = 0.
     }
 
 
-def _user_hours_in_month(db: Session, user_id: int, year: int, month: int) -> float:
-    """Foydalanuvchining shu oydagi intervyu soatlari yig'indisi.
+def _user_psych_activity_in_month(
+    db: Session, user_id: int, year: int, month: int
+) -> tuple[float, float]:
+    """Psixologik chat aktivligi: (soatlar, MB).
 
-    Manba: candidates.answers JSON ichidagi har turn'ning duration_sec maydoni.
+    Manba: chat_query_logs (error IS NULL) — bu jadval faqat
+    psixologik RAG so'rovlari uchun yoziladi, oddiy yozishmalar yo'q.
+
+    Hours hisobi: so'rovlar created_at bo'yicha tartiblanadi, 30 daqiqadan
+    katta tanaffus yangi sessiyani boshlaydi. Har sessiya min 5 daq /
+    max 2 soat oralig'iga cheklanadi.
     """
     try:
         from sqlalchemy import text as _sa_text
         sql = _sa_text(
             """
-            SELECT COALESCE(SUM(
-                CASE
-                    WHEN ans->>'duration_sec' ~ '^[0-9.]+$' THEN (ans->>'duration_sec')::float
-                    ELSE 0
-                END
-            ), 0) AS total_sec
-            FROM candidates c,
-                 jsonb_array_elements(COALESCE(c.answers, '[]'::json)::jsonb) AS ans
-            WHERE c.owner_id = :uid
-              AND EXTRACT(YEAR FROM c.created_at) = :y
-              AND EXTRACT(MONTH FROM c.created_at) = :m
+            SELECT created_at, COALESCE(OCTET_LENGTH(query), 0) AS qbytes
+            FROM chat_query_logs
+            WHERE user_id = :uid
+              AND error IS NULL
+              AND EXTRACT(YEAR FROM created_at) = :y
+              AND EXTRACT(MONTH FROM created_at) = :m
+            ORDER BY created_at ASC
             """
         )
-        row = db.execute(sql, {"uid": user_id, "y": year, "m": month}).first()
-        total_sec = float(row[0] or 0)
-        return round(total_sec / 3600.0, 2)
+        rows = db.execute(sql, {"uid": user_id, "y": year, "m": month}).fetchall()
     except Exception as exc:
-        logger.warning("_user_hours_in_month failed for user %s: %s", user_id, exc)
-        return 0.0
-
-
-def _user_mb_in_month(db: Session, user_id: int, year: int, month: int) -> float:
-    """User'ning shu oydagi chat xabarlari hajmi (MB).
-
-    Manba: chat_session_messages, role='user' bo'lganlar. Hajm OCTET_LENGTH
-    bilan baytda hisoblanadi va 1024*1024 ga bo'linadi.
-    """
-    try:
-        from sqlalchemy import text as _sa_text
-        sql = _sa_text(
-            """
-            SELECT COALESCE(SUM(OCTET_LENGTH(m.content)), 0) AS total_bytes
-            FROM chat_session_messages m
-            JOIN chat_sessions s ON s.id = m.session_id
-            WHERE s.user_id = :uid
-              AND m.role = 'user'
-              AND EXTRACT(YEAR FROM m.created_at) = :y
-              AND EXTRACT(MONTH FROM m.created_at) = :m
-            """
-        )
-        row = db.execute(sql, {"uid": user_id, "y": year, "m": month}).first()
-        total_bytes = float(row[0] or 0)
-        return round(total_bytes / (1024.0 * 1024.0), 4)
-    except Exception as exc:
-        logger.warning("_user_mb_in_month failed for user %s: %s", user_id, exc)
-        # SQLite fallback: LENGTH(CAST(... AS BLOB))
+        logger.warning("_user_psych_activity_in_month (pg) failed: %s", exc)
         try:
             from sqlalchemy import text as _sa_text
             sql = _sa_text(
                 """
-                SELECT COALESCE(SUM(LENGTH(CAST(m.content AS BLOB))), 0)
-                FROM chat_session_messages m
-                JOIN chat_sessions s ON s.id = m.session_id
-                WHERE s.user_id = :uid
-                  AND m.role = 'user'
-                  AND strftime('%Y', m.created_at) = :y
-                  AND strftime('%m', m.created_at) = :m
+                SELECT created_at, COALESCE(LENGTH(CAST(query AS BLOB)), 0) AS qbytes
+                FROM chat_query_logs
+                WHERE user_id = :uid
+                  AND error IS NULL
+                  AND strftime('%Y', created_at) = :y
+                  AND strftime('%m', created_at) = :m
+                ORDER BY created_at ASC
                 """
             )
-            row = db.execute(sql, {
+            rows = db.execute(sql, {
                 "uid": user_id, "y": str(year), "m": f"{month:02d}",
-            }).first()
-            total_bytes = float(row[0] or 0)
-            return round(total_bytes / (1024.0 * 1024.0), 4)
+            }).fetchall()
         except Exception as exc2:
-            logger.warning("_user_mb_in_month sqlite fallback failed: %s", exc2)
-            return 0.0
+            logger.warning("_user_psych_activity_in_month (sqlite) failed: %s", exc2)
+            return 0.0, 0.0
+
+    if not rows:
+        return 0.0, 0.0
+
+    total_bytes = 0
+    timestamps: list[datetime.datetime] = []
+    for r in rows:
+        ts, qb = r[0], r[1]
+        total_bytes += int(qb or 0)
+        if isinstance(ts, str):
+            try:
+                ts = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except Exception:
+                continue
+        if ts is not None:
+            timestamps.append(ts)
+
+    # Sessiyaga ajratish: 30 daq tanaffus → yangi sessiya
+    GAP = datetime.timedelta(minutes=30)
+    MIN_SESSION = datetime.timedelta(minutes=5)
+    MAX_SESSION = datetime.timedelta(hours=2)
+    total_sec = 0.0
+    if timestamps:
+        sess_start = timestamps[0]
+        sess_end = timestamps[0]
+        for ts in timestamps[1:]:
+            if ts - sess_end > GAP:
+                dur = max(sess_end - sess_start, MIN_SESSION)
+                dur = min(dur, MAX_SESSION)
+                total_sec += dur.total_seconds()
+                sess_start = ts
+            sess_end = ts
+        dur = max(sess_end - sess_start, MIN_SESSION)
+        dur = min(dur, MAX_SESSION)
+        total_sec += dur.total_seconds()
+
+    hours = round(total_sec / 3600.0, 2)
+    mb = round(total_bytes / (1024.0 * 1024.0), 4)
+    return hours, mb
+
+
+def _user_hours_in_month(db: Session, user_id: int, year: int, month: int) -> float:
+    """Backward-compat wrapper — faqat soat qaytaradi."""
+    h, _ = _user_psych_activity_in_month(db, user_id, year, month)
+    return h
+
+
+def _user_mb_in_month(db: Session, user_id: int, year: int, month: int) -> float:
+    """Backward-compat wrapper — faqat MB qaytaradi (psixologik chat'dan)."""
+    _, mb = _user_psych_activity_in_month(db, user_id, year, month)
+    return mb
 
 
 def _get_or_create_profile(db: Session, user_id: int) -> database.UserSalaryProfile:
@@ -458,8 +486,7 @@ def list_current_salaries(
     for prof, u, grade in profiles:
         if not grade:
             continue
-        hours = _user_hours_in_month(db, u.id, y, m)
-        mb = _user_mb_in_month(db, u.id, y, m)
+        hours, mb = _user_psych_activity_in_month(db, u.id, y, m)
         calc = calculate_salary(grade.base_salary, hours, mb)
         out.append(
             SalaryCurrent(
@@ -502,8 +529,7 @@ def get_user_current(
     now = datetime.datetime.utcnow()
     y = year or now.year
     m = month or now.month
-    hours = _user_hours_in_month(db, user_id, y, m)
-    mb = _user_mb_in_month(db, user_id, y, m)
+    hours, mb = _user_psych_activity_in_month(db, user_id, y, m)
     calc = calculate_salary(grade.base_salary, hours, mb)
     return SalaryCurrent(
         user_id=u.id,
@@ -547,8 +573,7 @@ def create_snapshot(
     grade = db.query(database.SalaryGrade).filter_by(id=prof.salary_grade_id).first()
     if not grade:
         raise HTTPException(status_code=400, detail="Грейд не найден")
-    hours = _user_hours_in_month(db, user_id, year, month)
-    mb = _user_mb_in_month(db, user_id, year, month)
+    hours, mb = _user_psych_activity_in_month(db, user_id, year, month)
     calc = calculate_salary(grade.base_salary, hours, mb)
     snap = database.SalarySnapshot(
         user_id=user_id,
@@ -585,6 +610,222 @@ def list_user_snapshots(
         .filter_by(user_id=user_id)
         .order_by(database.SalarySnapshot.year.desc(), database.SalarySnapshot.month.desc())
         .all()
+    )
+
+
+# === PDF report =============================================================
+
+_RU_MONTHS = [
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+]
+
+_FONT_CACHE: dict[str, str] = {}
+
+
+def _register_pdf_fonts() -> tuple[str, str]:
+    """Tizimdan kirillicha shriftni topib ro'yxatdan o'tkazadi.
+    (regular, bold) shrift nomlarini qaytaradi.
+    """
+    if _FONT_CACHE:
+        return _FONT_CACHE["regular"], _FONT_CACHE["bold"]
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    candidates = [
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        ("/Library/Fonts/Arial Unicode.ttf", "/Library/Fonts/Arial Unicode.ttf"),
+        ("/System/Library/Fonts/Supplemental/Arial.ttf",
+         "/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+        ("C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/arialbd.ttf"),
+    ]
+    for reg, bold in candidates:
+        if os.path.exists(reg):
+            try:
+                pdfmetrics.registerFont(TTFont("SalaryF", reg))
+                if os.path.exists(bold):
+                    pdfmetrics.registerFont(TTFont("SalaryFB", bold))
+                    _FONT_CACHE.update(regular="SalaryF", bold="SalaryFB")
+                else:
+                    _FONT_CACHE.update(regular="SalaryF", bold="SalaryF")
+                return _FONT_CACHE["regular"], _FONT_CACHE["bold"]
+            except Exception as exc:
+                logger.warning("Font register failed %s: %s", reg, exc)
+                continue
+    _FONT_CACHE.update(regular="Helvetica", bold="Helvetica-Bold")
+    return "Helvetica", "Helvetica-Bold"
+
+
+def _build_snapshot_pdf(snap: database.SalarySnapshot, user: database.User) -> bytes:
+    """SalarySnapshot uchun bir varaqlik hisob-kitob PDF generatsiyasi."""
+    import io
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+
+    fr, fb = _register_pdf_fonts()
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+
+    def fmt_money(v: float) -> str:
+        return f"{v:,.0f}".replace(",", " ") + " сум"
+
+    # Header
+    c.setFont(fb, 18)
+    c.drawString(40, height - 50, "Расчёт заработной платы")
+    c.setFont(fr, 10)
+    c.setFillGray(0.4)
+    period = f"{_RU_MONTHS[snap.month - 1]} {snap.year}"
+    c.drawString(40, height - 68, f"Период: {period}")
+    c.drawRightString(width - 40, height - 68,
+                      f"Создан: {snap.created_at.strftime('%d.%m.%Y %H:%M')}")
+    c.setFillGray(0)
+    c.setLineWidth(0.5)
+    c.line(40, height - 78, width - 40, height - 78)
+
+    # Employee block
+    y = height - 110
+    c.setFont(fb, 12)
+    c.drawString(40, y, "Сотрудник")
+    c.setFont(fr, 11)
+    y -= 18
+    c.drawString(40, y, f"ФИО: {user.name or '—'}")
+    y -= 16
+    c.drawString(40, y, f"Email: {user.email}")
+    y -= 16
+    c.drawString(40, y, f"Должность: {snap.position}")
+    y -= 16
+    c.drawString(40, y, f"Степень / звание: {snap.degree}")
+
+    # Calculations table
+    y -= 30
+    c.setFont(fb, 12)
+    c.drawString(40, y, "Расчёт")
+    y -= 6
+    c.setLineWidth(0.3)
+    c.line(40, y, width - 40, y)
+    y -= 18
+
+    rows = [
+        ("Базовая ставка (месяц)", fmt_money(snap.base_salary)),
+        ("Ставка в час (базовая / 22 / 8)", fmt_money(snap.hourly_rate) + "/ч"),
+        ("Отработано часов", f"{snap.hours_worked:.2f} ч"),
+        ("Введено данных", f"{getattr(snap, 'mb_input', 0.0):.4f} МБ"),
+        ("Объём % (МБ / 10 × 100)", f"{snap.percentage:.2f}%"),
+    ]
+    c.setFont(fr, 11)
+    for label, value in rows:
+        c.drawString(50, y, label)
+        c.drawRightString(width - 50, y, value)
+        y -= 18
+
+    # Formula box
+    y -= 8
+    c.setFillColorRGB(0.95, 0.97, 1.0)
+    c.rect(40, y - 38, width - 80, 38, fill=1, stroke=0)
+    c.setFillGray(0.2)
+    c.setFont(fr, 9)
+    c.drawString(50, y - 14,
+                 "Формула:  Зарплата = ставка/час × часы × (МБ / 10)")
+    c.drawString(50, y - 28,
+                 f"= {snap.hourly_rate:.2f} × {snap.hours_worked:.2f} × "
+                 f"{(getattr(snap, 'mb_input', 0.0) / 10.0):.4f}")
+    c.setFillGray(0)
+    y -= 60
+
+    # Total
+    c.setFont(fb, 14)
+    c.drawString(40, y, "Итого к выплате")
+    c.setFillColorRGB(0.05, 0.5, 0.3)
+    c.drawRightString(width - 40, y, fmt_money(snap.monthly_salary))
+    c.setFillGray(0)
+
+    # Footer note
+    c.setFont(fr, 8)
+    c.setFillGray(0.5)
+    c.drawString(40, 40,
+                 "Учитываются только реальные психологические обращения "
+                 "(chat_query_logs). Обычные переписки не считаются.")
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+@router.post("/snapshot/pdf")
+def create_snapshot_pdf(
+    user_id: int,
+    year: int,
+    month: int,
+    db: Session = Depends(_get_db),
+    _: database.User = Depends(_require_super_admin),
+):
+    """Snapshot yaratadi (yoki mavjudini oladi) va PDF qaytaradi.
+
+    Frontend `<a download>` orqali avto-yuklab oladi.
+    """
+    u = db.query(database.User).filter_by(id=user_id).first()
+    if not u:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    prof = db.query(database.UserSalaryProfile).filter_by(user_id=user_id).first()
+    if not prof or not prof.salary_grade_id:
+        raise HTTPException(status_code=400, detail="Пользователь без onboarding")
+    grade = db.query(database.SalaryGrade).filter_by(id=prof.salary_grade_id).first()
+    if not grade:
+        raise HTTPException(status_code=400, detail="Грейд не найден")
+
+    snap = (
+        db.query(database.SalarySnapshot)
+        .filter_by(user_id=user_id, year=year, month=month)
+        .first()
+    )
+    if not snap:
+        hours, mb = _user_psych_activity_in_month(db, user_id, year, month)
+        calc = calculate_salary(grade.base_salary, hours, mb)
+        snap = database.SalarySnapshot(
+            user_id=user_id,
+            year=year,
+            month=month,
+            position=grade.position,
+            degree=grade.degree,
+            base_salary=grade.base_salary,
+            hours_worked=hours,
+            mb_input=mb,
+            hourly_rate=calc["hourly_rate"],
+            percentage=calc["percentage"],
+            monthly_salary=calc["monthly_salary"],
+        )
+        db.add(snap)
+        try:
+            db.commit()
+            db.refresh(snap)
+        except Exception as exc:
+            db.rollback()
+            logger.warning("snapshot PDF create commit failed: %s", exc)
+            # Mavjud bo'lsa olamiz
+            snap = (
+                db.query(database.SalarySnapshot)
+                .filter_by(user_id=user_id, year=year, month=month)
+                .first()
+            )
+            if not snap:
+                raise HTTPException(status_code=500, detail="Не удалось создать snapshot")
+
+    try:
+        pdf_bytes = _build_snapshot_pdf(snap, u)
+    except Exception as exc:
+        logger.exception("PDF generation failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {exc}")
+
+    safe_name = (u.name or u.email or f"user{user_id}").replace(" ", "_")
+    filename = f"salary_{safe_name}_{year}_{month:02d}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
     )
 
 
