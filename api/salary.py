@@ -5,13 +5,16 @@
   • UserSalaryProfile — user'ning lavozimi (onboarding'da to'ldiriladi)
   • SalarySnapshot — har oy hisoblangan maosh (audit + tarix)
 
-Formula (universitet o'qituvchilari):
+Formula (universitet o'qituvchilari + data hajmi):
     hourly_rate    = base_salary / 22 / 8
-    percentage     = hours_worked / 176 * 100
-    monthly_salary = hourly_rate * hours_worked * (hours_worked / 176)
+    volume_ratio   = mb_input / 10.0           # 10 MB = 100%
+    percentage     = volume_ratio * 100
+    monthly_salary = hourly_rate * hours_worked * volume_ratio
 
 Sarflangan soat avtomatik intervyu sessiyalaridan hisoblanadi
 (candidates.answers[].duration_sec yig'indisi, oy bo'yicha).
+Kiritilgan hajm (MB) — user'ning chat_session_messages ichida role='user'
+xabarlari OCTET_LENGTH yig'indisi (oy bo'yicha) / 1048576.
 """
 from __future__ import annotations
 
@@ -136,6 +139,7 @@ class SalaryCurrent(BaseModel):
     base_salary: int
     hourly_rate: float
     hours_worked: float
+    mb_input: float
     percentage: float
     monthly_salary: float
     year: int
@@ -152,6 +156,7 @@ class SalarySnapshotOut(BaseModel):
     base_salary: int
     hours_worked: float
     hourly_rate: float
+    mb_input: float
     percentage: float
     monthly_salary: float
     created_at: datetime.datetime
@@ -162,12 +167,20 @@ class SalarySnapshotOut(BaseModel):
 
 # === Hisoblash formulasi ====================================================
 
-def calculate_salary(base_salary: int, hours_worked: float) -> dict:
-    """Universitet o'qituvchilari formulasi."""
+def calculate_salary(base_salary: int, hours_worked: float, mb_input: float = 0.0) -> dict:
+    """Universitet o'qituvchilari + data hajmi formulasi.
+
+    10 MB kiritilgan data = 100%. Ya'ni:
+        volume_ratio = mb_input / 10
+        monthly_salary = hourly_rate * hours_worked * volume_ratio
+    """
     hourly_rate = base_salary / 22 / 8 if base_salary > 0 else 0.0
-    percentage = (hours_worked / 176.0) * 100.0 if hours_worked > 0 else 0.0
+    volume_ratio = (mb_input / 10.0) if mb_input > 0 else 0.0
+    percentage = volume_ratio * 100.0
     monthly_salary = (
-        hourly_rate * hours_worked * (hours_worked / 176.0) if hours_worked > 0 else 0.0
+        hourly_rate * hours_worked * volume_ratio
+        if hours_worked > 0 and volume_ratio > 0
+        else 0.0
     )
     return {
         "hourly_rate": round(hourly_rate, 2),
@@ -204,6 +217,54 @@ def _user_hours_in_month(db: Session, user_id: int, year: int, month: int) -> fl
     except Exception as exc:
         logger.warning("_user_hours_in_month failed for user %s: %s", user_id, exc)
         return 0.0
+
+
+def _user_mb_in_month(db: Session, user_id: int, year: int, month: int) -> float:
+    """User'ning shu oydagi chat xabarlari hajmi (MB).
+
+    Manba: chat_session_messages, role='user' bo'lganlar. Hajm OCTET_LENGTH
+    bilan baytda hisoblanadi va 1024*1024 ga bo'linadi.
+    """
+    try:
+        from sqlalchemy import text as _sa_text
+        sql = _sa_text(
+            """
+            SELECT COALESCE(SUM(OCTET_LENGTH(m.content)), 0) AS total_bytes
+            FROM chat_session_messages m
+            JOIN chat_sessions s ON s.id = m.session_id
+            WHERE s.user_id = :uid
+              AND m.role = 'user'
+              AND EXTRACT(YEAR FROM m.created_at) = :y
+              AND EXTRACT(MONTH FROM m.created_at) = :m
+            """
+        )
+        row = db.execute(sql, {"uid": user_id, "y": year, "m": month}).first()
+        total_bytes = float(row[0] or 0)
+        return round(total_bytes / (1024.0 * 1024.0), 4)
+    except Exception as exc:
+        logger.warning("_user_mb_in_month failed for user %s: %s", user_id, exc)
+        # SQLite fallback: LENGTH(CAST(... AS BLOB))
+        try:
+            from sqlalchemy import text as _sa_text
+            sql = _sa_text(
+                """
+                SELECT COALESCE(SUM(LENGTH(CAST(m.content AS BLOB))), 0)
+                FROM chat_session_messages m
+                JOIN chat_sessions s ON s.id = m.session_id
+                WHERE s.user_id = :uid
+                  AND m.role = 'user'
+                  AND strftime('%Y', m.created_at) = :y
+                  AND strftime('%m', m.created_at) = :m
+                """
+            )
+            row = db.execute(sql, {
+                "uid": user_id, "y": str(year), "m": f"{month:02d}",
+            }).first()
+            total_bytes = float(row[0] or 0)
+            return round(total_bytes / (1024.0 * 1024.0), 4)
+        except Exception as exc2:
+            logger.warning("_user_mb_in_month sqlite fallback failed: %s", exc2)
+            return 0.0
 
 
 def _get_or_create_profile(db: Session, user_id: int) -> database.UserSalaryProfile:
@@ -398,7 +459,8 @@ def list_current_salaries(
         if not grade:
             continue
         hours = _user_hours_in_month(db, u.id, y, m)
-        calc = calculate_salary(grade.base_salary, hours)
+        mb = _user_mb_in_month(db, u.id, y, m)
+        calc = calculate_salary(grade.base_salary, hours, mb)
         out.append(
             SalaryCurrent(
                 user_id=u.id,
@@ -408,6 +470,7 @@ def list_current_salaries(
                 degree=grade.degree,
                 base_salary=grade.base_salary,
                 hours_worked=hours,
+                mb_input=mb,
                 hourly_rate=calc["hourly_rate"],
                 percentage=calc["percentage"],
                 monthly_salary=calc["monthly_salary"],
@@ -440,7 +503,8 @@ def get_user_current(
     y = year or now.year
     m = month or now.month
     hours = _user_hours_in_month(db, user_id, y, m)
-    calc = calculate_salary(grade.base_salary, hours)
+    mb = _user_mb_in_month(db, user_id, y, m)
+    calc = calculate_salary(grade.base_salary, hours, mb)
     return SalaryCurrent(
         user_id=u.id,
         user_name=u.name or u.email,
@@ -449,6 +513,7 @@ def get_user_current(
         degree=grade.degree,
         base_salary=grade.base_salary,
         hours_worked=hours,
+        mb_input=mb,
         hourly_rate=calc["hourly_rate"],
         percentage=calc["percentage"],
         monthly_salary=calc["monthly_salary"],
@@ -483,7 +548,8 @@ def create_snapshot(
     if not grade:
         raise HTTPException(status_code=400, detail="Грейд не найден")
     hours = _user_hours_in_month(db, user_id, year, month)
-    calc = calculate_salary(grade.base_salary, hours)
+    mb = _user_mb_in_month(db, user_id, year, month)
+    calc = calculate_salary(grade.base_salary, hours, mb)
     snap = database.SalarySnapshot(
         user_id=user_id,
         year=year,
@@ -492,6 +558,7 @@ def create_snapshot(
         degree=grade.degree,
         base_salary=grade.base_salary,
         hours_worked=hours,
+        mb_input=mb,
         hourly_rate=calc["hourly_rate"],
         percentage=calc["percentage"],
         monthly_salary=calc["monthly_salary"],

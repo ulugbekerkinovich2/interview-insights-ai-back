@@ -763,6 +763,7 @@ async def startup():
                 "ALTER TABLE user_salary_profiles ADD COLUMN IF NOT EXISTS years_of_experience INTEGER",
                 "ALTER TABLE user_salary_profiles ADD COLUMN IF NOT EXISTS education TEXT",
                 "ALTER TABLE user_salary_profiles ADD COLUMN IF NOT EXISTS bio TEXT",
+                "ALTER TABLE salary_snapshots ADD COLUMN IF NOT EXISTS mb_input DOUBLE PRECISION NOT NULL DEFAULT 0.0",
             ]:
                 try:
                     conn.execute(_sa_text(ddl))

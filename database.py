@@ -241,7 +241,8 @@ class SalarySnapshot(Base):
     base_salary = Column(Integer, nullable=False)
     hours_worked = Column(Float, nullable=False, default=0.0)
     hourly_rate = Column(Float, nullable=False, default=0.0)
-    percentage = Column(Float, nullable=False, default=0.0)   # 0-100
+    percentage = Column(Float, nullable=False, default=0.0)   # 0-100 (MB/10 * 100)
+    mb_input = Column(Float, nullable=False, default=0.0)     # user'ning chat xabarlari hajmi (MB)
     monthly_salary = Column(Float, nullable=False, default=0.0)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
 
