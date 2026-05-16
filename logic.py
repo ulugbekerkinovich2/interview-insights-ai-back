@@ -251,6 +251,12 @@ MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+# "not_used_but_required_by_config" kabi placeholder qiymatlarni bo'sh deb hisoblaymiz
+if OPENAI_API_KEY and (OPENAI_API_KEY.startswith("not_used") or len(OPENAI_API_KEY) < 20):
+    OPENAI_API_KEY = ""
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions")
 AI_PROVIDER = (os.getenv("AI_PROVIDER", "auto") or "auto").strip().lower()
 
 
@@ -297,6 +303,43 @@ def _call_mistral_cloud(prompt: str) -> str:
     return text
 
 
+def _call_openai_cloud(prompt: str) -> str:
+    """OpenAI Cloud API chaqiruvi (gpt-4o-mini) — Mistral fallback."""
+    if not OPENAI_API_KEY:
+        raise AIServiceError("OPENAI_API_KEY not set")
+
+    try:
+        from utils import cost_tracker
+        cost_tracker.check_limits()
+    except Exception as exc:
+        raise AIServiceError(str(exc))
+
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    data = {
+        "model": OPENAI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 2048,
+    }
+    try:
+        resp = http_requests.post(OPENAI_API_URL, json=data, headers=headers, timeout=300)
+        resp.raise_for_status()
+        text = resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        raise AIServiceError(f"OpenAI request failed: {exc}") from exc
+
+    if not text:
+        raise AIServiceError("OpenAI returned empty response")
+
+    try:
+        cost = cost_tracker.estimate_openai_cost(len(prompt), len(text))
+        cost_tracker.record("openai", cost)
+    except Exception:
+        pass
+
+    return text
+
+
 def _call_ollama(prompt: str) -> str:
     """Primary local LLM call via Ollama server."""
     try:
@@ -318,19 +361,31 @@ def _call_ollama(prompt: str) -> str:
 
 
 def _call_ai(prompt: str) -> str:
-    """Route LLM calls using env-based provider policy."""
+    """Route LLM calls using env-based provider policy.
+
+    Fallback zanjiri (auto / mistral_then_ollama):
+        Mistral → OpenAI (gpt-4o-mini) → Ollama
+    """
     if AI_PROVIDER == "ollama":
         return _call_ollama(prompt)
 
     if AI_PROVIDER == "mistral":
         return _call_mistral_cloud(prompt)
 
-    if AI_PROVIDER in {"auto", "mistral_then_ollama"}:
+    if AI_PROVIDER == "openai":
+        return _call_openai_cloud(prompt)
+
+    if AI_PROVIDER in {"auto", "mistral_then_ollama", "mistral_then_openai"}:
         if MISTRAL_API_KEY:
             try:
                 return _call_mistral_cloud(prompt)
             except AIServiceError as exc:
-                logger.warning(f"Mistral Cloud error, falling back to Ollama: {exc}")
+                logger.warning(f"Mistral Cloud error, trying OpenAI: {exc}")
+        if OPENAI_API_KEY:
+            try:
+                return _call_openai_cloud(prompt)
+            except AIServiceError as exc:
+                logger.warning(f"OpenAI error, falling back to Ollama: {exc}")
         return _call_ollama(prompt)
 
     if AI_PROVIDER == "ollama_then_mistral":
@@ -339,7 +394,12 @@ def _call_ai(prompt: str) -> str:
         except AIServiceError as exc:
             logger.warning(f"Ollama error, falling back to Mistral: {exc}")
             if MISTRAL_API_KEY:
-                return _call_mistral_cloud(prompt)
+                try:
+                    return _call_mistral_cloud(prompt)
+                except AIServiceError as exc2:
+                    logger.warning(f"Mistral fallback failed, trying OpenAI: {exc2}")
+            if OPENAI_API_KEY:
+                return _call_openai_cloud(prompt)
             raise
 
     raise AIServiceError(f"Unsupported AI_PROVIDER value: {AI_PROVIDER}")
@@ -379,6 +439,10 @@ def get_ai_runtime_status() -> dict:
         "mistral": {
             "configured": bool(MISTRAL_API_KEY),
             "model": MISTRAL_MODEL,
+        },
+        "openai": {
+            "configured": bool(OPENAI_API_KEY),
+            "model": OPENAI_MODEL,
         },
         "ollama": ollama_status,
     }
@@ -608,6 +672,66 @@ def _call_mistral_cloud_stream(prompt: str):
         pass
 
 
+def _call_openai_cloud_stream(prompt: str):
+    """OpenAI gpt-4o-mini streaming — SSE token'lar."""
+    if not OPENAI_API_KEY:
+        raise AIServiceError("OPENAI_API_KEY not set")
+    try:
+        from utils import cost_tracker
+        cost_tracker.check_limits()
+    except Exception as exc:
+        raise AIServiceError(str(exc))
+
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    data = {
+        "model": OPENAI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 2048,
+        "stream": True,
+    }
+    full_text = ""
+    try:
+        resp = http_requests.post(OPENAI_API_URL, json=data, headers=headers, timeout=300, stream=True)
+        resp.raise_for_status()
+        import json as _json
+        for raw_line in resp.iter_lines():
+            if not raw_line:
+                continue
+            try:
+                line = raw_line.decode("utf-8") if isinstance(raw_line, (bytes, bytearray)) else raw_line
+            except Exception:
+                continue
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                chunk = _json.loads(payload)
+            except Exception:
+                continue
+            try:
+                delta = chunk["choices"][0].get("delta", {}) or {}
+                content = delta.get("content", "")
+                if content:
+                    full_text += content
+                    yield content
+            except (KeyError, IndexError, TypeError):
+                continue
+    except http_requests.RequestException as exc:
+        raise AIServiceError(f"OpenAI stream failed: {exc}") from exc
+
+    if not full_text:
+        raise AIServiceError("OpenAI stream returned empty response")
+
+    try:
+        cost = cost_tracker.estimate_openai_cost(len(prompt), len(full_text))
+        cost_tracker.record("openai", cost)
+    except Exception:
+        pass
+
+
 def _call_ollama_stream(prompt: str):
     """Ollama streaming — line-delimited JSON token'lar."""
     try:
@@ -644,20 +768,33 @@ def _call_ollama_stream(prompt: str):
 
 
 def _call_ai_stream(prompt: str):
-    """Streaming variant — `_call_ai` mantiqini ta'qib etadi (provider routing)."""
+    """Streaming variant — `_call_ai` mantiqini ta'qib etadi (provider routing).
+
+    Fallback zanjiri (auto / mistral_then_ollama):
+        Mistral stream → OpenAI stream → Ollama stream
+    """
     if AI_PROVIDER == "ollama":
         yield from _call_ollama_stream(prompt)
         return
     if AI_PROVIDER == "mistral":
         yield from _call_mistral_cloud_stream(prompt)
         return
-    if AI_PROVIDER in {"auto", "mistral_then_ollama"}:
+    if AI_PROVIDER == "openai":
+        yield from _call_openai_cloud_stream(prompt)
+        return
+    if AI_PROVIDER in {"auto", "mistral_then_ollama", "mistral_then_openai"}:
         if MISTRAL_API_KEY:
             try:
                 yield from _call_mistral_cloud_stream(prompt)
                 return
             except AIServiceError as exc:
-                logger.warning(f"Mistral stream error, falling back to Ollama: {exc}")
+                logger.warning(f"Mistral stream error, trying OpenAI: {exc}")
+        if OPENAI_API_KEY:
+            try:
+                yield from _call_openai_cloud_stream(prompt)
+                return
+            except AIServiceError as exc:
+                logger.warning(f"OpenAI stream error, falling back to Ollama: {exc}")
         yield from _call_ollama_stream(prompt)
         return
     if AI_PROVIDER == "ollama_then_mistral":
@@ -667,7 +804,13 @@ def _call_ai_stream(prompt: str):
         except AIServiceError as exc:
             logger.warning(f"Ollama stream error, falling back to Mistral: {exc}")
             if MISTRAL_API_KEY:
-                yield from _call_mistral_cloud_stream(prompt)
+                try:
+                    yield from _call_mistral_cloud_stream(prompt)
+                    return
+                except AIServiceError as exc2:
+                    logger.warning(f"Mistral stream fallback failed, trying OpenAI: {exc2}")
+            if OPENAI_API_KEY:
+                yield from _call_openai_cloud_stream(prompt)
                 return
             raise
     raise AIServiceError(f"Unsupported AI_PROVIDER value: {AI_PROVIDER}")

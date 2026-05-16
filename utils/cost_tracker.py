@@ -40,10 +40,17 @@ COST_TRACKING_ENABLED = os.getenv("AI_COST_TRACKING_ENABLED", "true").lower() no
 
 
 # --- Baholash parametrlari ---
-# Mistral tokenlari uchun taxminiy chars→tokens ratio (ruscha matn uchun ~3 chars = 1 token)
+# Tokenlar uchun taxminiy chars→tokens ratio (ruscha matn uchun ~3 chars = 1 token)
+AVG_TOKEN_CHARS = 3.0
+
+# Mistral mistral-small-latest tarifi
 MISTRAL_INPUT_PER_1M_USD = 0.20
 MISTRAL_OUTPUT_PER_1M_USD = 0.60
-MISTRAL_AVG_TOKEN_CHARS = 3.0
+MISTRAL_AVG_TOKEN_CHARS = AVG_TOKEN_CHARS  # backward-compat
+
+# OpenAI gpt-4o-mini tarifi (Mistral fallback)
+OPENAI_INPUT_PER_1M_USD = 0.15
+OPENAI_OUTPUT_PER_1M_USD = 0.60
 
 # Deepgram nova-2 tarifi
 DEEPGRAM_USD_PER_MINUTE = 0.0043
@@ -84,9 +91,16 @@ def _rotate_if_needed() -> None:
 
 def estimate_mistral_cost(input_chars: int, output_chars: int) -> float:
     """Mistral Cloud API chaqiruvi uchun taxminiy xarajat."""
-    in_tokens = input_chars / MISTRAL_AVG_TOKEN_CHARS
-    out_tokens = output_chars / MISTRAL_AVG_TOKEN_CHARS
+    in_tokens = input_chars / AVG_TOKEN_CHARS
+    out_tokens = output_chars / AVG_TOKEN_CHARS
     return (in_tokens / 1_000_000) * MISTRAL_INPUT_PER_1M_USD + (out_tokens / 1_000_000) * MISTRAL_OUTPUT_PER_1M_USD
+
+
+def estimate_openai_cost(input_chars: int, output_chars: int) -> float:
+    """OpenAI gpt-4o-mini chaqiruvi uchun taxminiy xarajat."""
+    in_tokens = input_chars / AVG_TOKEN_CHARS
+    out_tokens = output_chars / AVG_TOKEN_CHARS
+    return (in_tokens / 1_000_000) * OPENAI_INPUT_PER_1M_USD + (out_tokens / 1_000_000) * OPENAI_OUTPUT_PER_1M_USD
 
 
 def estimate_deepgram_cost(audio_duration_sec: float) -> float:
