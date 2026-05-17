@@ -1142,6 +1142,26 @@ def chat_knowledge(
     intent = kb.parse_intent(query, role=role)
 
     if intent is not None:
+        # Admin buyruqlari ham ChatQueryLog'ga yoziladi — psixolog ish
+        # vaqti va kiritgan ma'lumotlari (maosh hisobi) uchun.
+        try:
+            _persist_chat_log(
+                db,
+                user_id=user.id,
+                role=role,
+                query=query,
+                answer=f"[admin-command: {intent.action}]",
+                confidence=None,
+                chunks_used=0,
+                citations_count=0,
+                backend="admin_intent",
+                latency_ms=0,
+                streamed=False,
+                error=None,
+            )
+        except Exception as exc:
+            logger.warning("admin command chat log failed: %s", exc)
+
         if intent.action == "save":
             return _chat_save(db, user, intent.title or "", intent.content or "")
         if intent.action == "list_drafts":
@@ -1357,13 +1377,18 @@ def _persist_chat_log(
     streamed: bool,
     error: Optional[str] = None,
 ) -> None:
-    """ChatQueryLog jadvaliga audit yozadi (analytics uchun)."""
+    """ChatQueryLog jadvaliga audit yozadi (analytics + maosh hisobi uchun).
+
+    Maosh hisobi `OCTET_LENGTH(query)` ga asoslangani uchun query'ni
+    kesmaslik MUHIM — uzun yozgan psixolog kam haq olmasligi kerak.
+    Hozir 200K belgigacha (PostgreSQL TEXT cheksiz) saqlanadi.
+    """
     try:
         log = database.ChatQueryLog(
             user_id=user_id,
             role=role,
-            query=query[:5000],
-            answer=(answer or "")[:10000],
+            query=query[:200000],            # 5000 → 200K (maosh hisobi adolatli)
+            answer=(answer or "")[:200000],  # 10000 → 200K
             confidence=confidence,
             chunks_used=chunks_used,
             citations_count=citations_count,

@@ -16,7 +16,15 @@ Oddiy yozishmalar (boshqa chat sessiyalari yoki kandidat intervyulari) hisobga
 olinmaydi.
 
   • MB    = SUM(OCTET_LENGTH(query)) / 1048576 — user'ning psixologik
-            so'rovlari hajmi (error IS NULL).
+            so'rovlari hajmi. Query 200K belgigacha kesilmasdan saqlanadi
+            (uzun yozgan psixolog kam haq olmaydi).
+            Quyidagilar HISOBLANADI:
+              - error IS NULL — muvaffaqiyatli javob olingan so'rovlar
+              - error = 'cancelled_by_client' — psixolog Stop bossa ham
+                ish vaqti hisoblanadi (matn yozilgan, AI ishlashni
+                boshlagan edi).
+              - Admin buyruqlari (`save:`, `approve N`, `reindex` va h.k.)
+                ham log qilinadi (psixolog bilim qo'shsa ish hisoblanadi).
   • Hours = psixologik so'rovlar orasidagi vaqt yig'indisi, 30 daqiqalik
             tanaffus bilan sessiyalarga ajratiladi (har sessiya
             max 2 soat bilan cheklanadi, sessiyaning o'zi >0 bo'lsa min 5
@@ -209,12 +217,18 @@ def _user_psych_activity_in_month(
     """
     try:
         from sqlalchemy import text as _sa_text
+        # MUHIM: WHERE error IS NULL emas — agar psixolog Stop bossa
+        # (cancelled_by_client), u vaqt va matn yozgan deb hisoblanadi.
+        # Faqat haqiqiy server xatolarini chiqarib tashlaymiz.
         sql = _sa_text(
             """
             SELECT created_at, COALESCE(OCTET_LENGTH(query), 0) AS qbytes
             FROM chat_query_logs
             WHERE user_id = :uid
-              AND error IS NULL
+              AND (
+                error IS NULL
+                OR error = 'cancelled_by_client'
+              )
               AND EXTRACT(YEAR FROM created_at) = :y
               AND EXTRACT(MONTH FROM created_at) = :m
             ORDER BY created_at ASC
@@ -230,7 +244,7 @@ def _user_psych_activity_in_month(
                 SELECT created_at, COALESCE(LENGTH(CAST(query AS BLOB)), 0) AS qbytes
                 FROM chat_query_logs
                 WHERE user_id = :uid
-                  AND error IS NULL
+                  AND (error IS NULL OR error = 'cancelled_by_client')
                   AND strftime('%Y', created_at) = :y
                   AND strftime('%m', created_at) = :m
                 ORDER BY created_at ASC
