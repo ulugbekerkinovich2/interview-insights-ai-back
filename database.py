@@ -339,6 +339,32 @@ class JobRecord(Base):
     finished_at = Column(DateTime, nullable=True)
 
 
+class AuditLog(Base):
+    """Audit log — har xil muhim amallar (delete, update, create, login)
+    kim tomonidan qachon qilinganini saqlaydi.
+
+    Davlat tashkilotlarida regulyator talablari uchun majburiy.
+    Frontend `/audit` sahifa orqali SuperAdmin ko'rishi mumkin.
+    """
+    __tablename__ = "audit_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # Kim (user o'chirilsa SET NULL — log saqlanadi)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    user_email = Column(String, nullable=True, index=True)   # log'da ko'rsatish uchun snapshot
+    user_role = Column(String, nullable=True)                 # SuperAdmin/Psychologist/User
+    # Nima qilingan
+    action = Column(String, nullable=False, index=True)       # "delete", "update", "create", "login", "logout"
+    entity_type = Column(String, nullable=True, index=True)   # "candidate", "user", "salary_grade", "chat_session"
+    entity_id = Column(String, nullable=True, index=True)     # ID — text (turli xil bo'lishi mumkin)
+    entity_label = Column(String, nullable=True)              # "Иван Петров", "Профессор" — human-readable
+    # Kontekst (optional)
+    details = Column(JSON, nullable=True)                     # qo'shimcha ma'lumot (before/after, IP, va h.k.)
+    ip_address = Column(String, nullable=True)
+    # Qachon
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
 

@@ -60,6 +60,7 @@ import schemas
 import logic
 from api.knowledge import router as knowledge_router
 from api.salary import router as salary_router, seed_salary_grades as _seed_salary_grades
+from api.audit import router as audit_router
 from utils.executor import (
     stt_executor, llm_executor, frame_executor, run_bounded, QueueFull, pool_stats,
     shutdown_all as _shutdown_executors,
@@ -685,6 +686,7 @@ async def limit_request_body(request: Request, call_next):
 # Role-based RAG knowledge-base API (/knowledge/*).
 app.include_router(knowledge_router)
 app.include_router(salary_router)
+app.include_router(audit_router)
 
 # app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media") # Unsecured mount removed
 
