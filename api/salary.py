@@ -29,7 +29,7 @@ import logging
 import os
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field
@@ -369,14 +369,36 @@ def update_grade(
 @router.delete("/grades/{grade_id}")
 def delete_grade(
     grade_id: int,
+    request: Request,
     db: Session = Depends(_get_db),
-    _: database.User = Depends(_require_super_admin),
+    user: database.User = Depends(_require_super_admin),
 ):
     grade = db.query(database.SalaryGrade).filter_by(id=grade_id).first()
     if not grade:
         raise HTTPException(status_code=404, detail="Не найдено")
+    snapshot = {
+        "id": grade.id,
+        "position": grade.position,
+        "degree": grade.degree,
+        "base_salary": grade.base_salary,
+    }
+    label = f"{grade.position} / {grade.degree}"
     db.delete(grade)
     db.commit()
+    # Audit log
+    try:
+        from utils.audit import log_audit
+        log_audit(
+            db, user,
+            action="delete",
+            entity_type="salary_grade",
+            entity_id=str(grade_id),
+            entity_label=label,
+            details=snapshot,
+            request=request,
+        )
+    except Exception:
+        pass
     return {"status": "deleted"}
 
 

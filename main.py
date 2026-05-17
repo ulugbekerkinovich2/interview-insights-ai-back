@@ -766,6 +766,14 @@ async def startup():
                 "ALTER TABLE user_salary_profiles ADD COLUMN IF NOT EXISTS education TEXT",
                 "ALTER TABLE user_salary_profiles ADD COLUMN IF NOT EXISTS bio TEXT",
                 "ALTER TABLE salary_snapshots ADD COLUMN IF NOT EXISTS mb_input DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+                # Scale indexes — 100k+ record'da qidiruv tez bo'lsin
+                "CREATE INDEX IF NOT EXISTS ix_candidates_name ON candidates (name)",
+                "CREATE INDEX IF NOT EXISTS ix_candidates_status ON candidates (status)",
+                "CREATE INDEX IF NOT EXISTS ix_candidates_created_at ON candidates (created_at DESC)",
+                # ILIKE pattern uchun trigram (PostgreSQL pg_trgm extension) —
+                # extension yo'q bo'lsa CREATE INDEX xatoga uchraydi, lekin try/except ushlaydi
+                "CREATE INDEX IF NOT EXISTS ix_audit_log_action ON audit_log (action)",
+                "CREATE INDEX IF NOT EXISTS ix_audit_log_entity_type ON audit_log (entity_type)",
             ]:
                 try:
                     conn.execute(_sa_text(ddl))
@@ -1309,31 +1317,67 @@ def get_candidate_timing(candidate_id: int, db: Session = Depends(get_db), _: da
 def read_candidates(
     limit: int = 200,
     offset: int = 0,
+    page: int = 0,
+    size: int = 0,
+    q: Optional[str] = None,
+    status: Optional[str] = None,
     include_answers: bool = False,
     db: Session = Depends(get_db),
     _: database.User = Depends(require_admin),
 ):
-    """Nomzodlar ro'yxati. Default `include_answers=false` — `answers` JSON
-    qaytarilmaydi (10x tezroq, har nomzod 5-50 KB tejash). Frontend list view'da
-    answers kerak emas — faqat detail page'da `GET /candidates/{id}` orqali olinadi.
+    """Nomzodlar ro'yxati. Server-side pagination + qidiruv + filter.
 
-    Pagination: `limit=200` (max 500), `offset=0`."""
-    if limit < 1:
-        limit = 1
-    if limit > 500:
-        limit = 500
-    if offset < 0:
-        offset = 0
+    Pagination:
+      - Yangi format: `?page=1&size=25` (1-indexed)
+      - Eski format: `?limit=200&offset=0` (backward compat)
 
-    q = db.query(Candidate).order_by(Candidate.created_at.desc())
-    candidates = q.offset(offset).limit(limit).all()
+    Qidiruv (`q=`): name, display_id, summary (case-insensitive ILIKE)
+    Filter (`status=`): "New" / "In Progress" / "Completed" / "Hired" / "Rejected"
+
+    Response header'da `X-Total-Count: <total>` qaytariladi — frontend
+    pagination UI uchun.
+
+    `include_answers=false` (default) — `answers` JSON qaytarilmaydi
+    (10x tezroq, har nomzod 5-50 KB tejash).
+    """
+    # Page/size argumentlari ustuvor — agar berilgan bo'lsa
+    if page > 0 and size > 0:
+        if size > 500:
+            size = 500
+        offset = (page - 1) * size
+        limit = size
+    else:
+        if limit < 1:
+            limit = 1
+        if limit > 500:
+            limit = 500
+        if offset < 0:
+            offset = 0
+
+    qs = db.query(Candidate)
+
+    # Filter — status
+    if status:
+        qs = qs.filter(Candidate.status == status)
+
+    # Qidiruv — name / display_id / summary
+    if q:
+        like = f"%{q.strip()}%"
+        from sqlalchemy import or_
+        qs = qs.filter(
+            or_(
+                Candidate.name.ilike(like),
+                Candidate.display_id.ilike(like),
+                Candidate.summary.ilike(like),
+            )
+        )
+
+    qs = qs.order_by(Candidate.created_at.desc())
+    candidates = qs.offset(offset).limit(limit).all()
 
     if not include_answers:
         # `answers` ni bo'sh ro'yxatga almashtirib, response payload'ni 90% kichraytiramiz.
-        # Pydantic ORM mode'da to'g'ri ishlashi uchun objektlarni nusxalaymiz.
         for c in candidates:
-            # SQLAlchemy attribute'ni o'zgartirsak DB'ga sync bo'lib qoladi —
-            # session.expunge orqali ajratamiz, keyin `answers` ni `[]` qilamiz.
             try:
                 db.expunge(c)
                 c.answers = []
@@ -1341,6 +1385,32 @@ def read_candidates(
                 pass
 
     return candidates
+
+
+@app.get("/candidates/count")
+def count_candidates(
+    q: Optional[str] = None,
+    status: Optional[str] = None,
+    db: Session = Depends(get_db),
+    _: database.User = Depends(require_admin),
+):
+    """Pagination UI uchun jami count.
+    Filter parametrlari /candidates/ bilan bir xil.
+    """
+    qs = db.query(Candidate)
+    if status:
+        qs = qs.filter(Candidate.status == status)
+    if q:
+        like = f"%{q.strip()}%"
+        from sqlalchemy import or_
+        qs = qs.filter(
+            or_(
+                Candidate.name.ilike(like),
+                Candidate.display_id.ilike(like),
+                Candidate.summary.ilike(like),
+            )
+        )
+    return {"total": qs.count()}
 
 @app.get("/candidates/{candidate_id}/visual", response_model=List[schemas.VisualRecordSchema])
 def read_visual_records(
@@ -1658,17 +1728,43 @@ def _delete_candidate_media(candidate_id: int, db: Session) -> dict:
 
 
 @app.delete("/candidates/{candidate_id}")
-def delete_candidate(candidate_id: int, db: Session = Depends(get_db), _: database.User = Depends(require_role(["SuperAdmin", "Recruiter"]))):
+def delete_candidate(
+    candidate_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: database.User = Depends(require_role(["SuperAdmin", "Recruiter"])),
+):
     """Nomzodni to'liq o'chirish — GDPR "o'chirilish huquqi" (right to erasure).
     DB yozuvlari (visual_records CASCADE orqali) + media fayllar (frames, audio)
-    birga o'chiriladi."""
+    birga o'chiriladi. Audit log'ga yoziladi."""
     candidate = get_candidate_or_404(db, candidate_id)
+    # Snapshot — log uchun (delete'dan keyin candidate yo'q bo'ladi)
+    snapshot = {
+        "id": candidate.id,
+        "name": candidate.name,
+        "display_id": candidate.display_id,
+        "status": candidate.status,
+    }
     media_stats = _delete_candidate_media(candidate_id, db)
-    # Endi CASCADE bor — visual_records avtomatik o'chadi.
-    # Lekin SQLite da CASCADE ishlashi uchun PRAGMA kerak, shu sababli qo'lda ham.
     db.query(database.VisualRecord).filter(database.VisualRecord.candidate_id == candidate_id).delete()
     db.delete(candidate)
     db.commit()
+
+    # Audit log (xato sukut bilan o'tadi — asosiy oqimni to'xtatmaydi)
+    try:
+        from utils.audit import log_audit
+        log_audit(
+            db, user,
+            action="delete",
+            entity_type="candidate",
+            entity_id=str(candidate_id),
+            entity_label=snapshot["name"],
+            details={"deleted": snapshot, "media": media_stats},
+            request=request,
+        )
+    except Exception:
+        pass
+
     return {"status": "deleted", "media": media_stats}
 
 
