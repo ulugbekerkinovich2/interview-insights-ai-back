@@ -661,6 +661,46 @@ app.add_middleware(
 )
 
 
+# ====================================================================
+# #54 — Security headers middleware (HSTS, CSP, X-Frame-Options, va h.k.)
+# Davlat tashkilotlari uchun majburiy (clickjacking, MIME-sniff, XSS himoya).
+# ====================================================================
+_IS_PRODUCTION = (os.getenv("ENVIRONMENT", "development").lower() == "production")
+
+@app.middleware("http")
+async def security_headers_middleware(request, call_next):
+    response = await call_next(request)
+    # Clickjacking — frame ichida sayt yuklanmasin
+    response.headers["X-Frame-Options"] = "DENY"
+    # MIME type sniffing — javob `text/html` deb noto'g'ri talqin qilinmasin
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    # Referrer minimal — to'liq URL boshqa saytga uzatilmaydi
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # Cross-origin permissions — kamera/mikrofon faqat shu sayt uchun
+    response.headers["Permissions-Policy"] = "camera=(self), microphone=(self), geolocation=()"
+    # XSS protection (eski brauzerlar)
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    # HSTS — faqat HTTPS prodakshen muhitida (lokal dev'da brauzerga HSTS pin
+    # qo'yib qo'ymaslik uchun)
+    if _IS_PRODUCTION:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    # CSP — strict, lekin `unsafe-inline` Vite dev uchun kerak. Prodakshen
+    # build'da inline yo'q, lekin recharts/markdown uchun blob: ham kerak.
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com data:; "
+        "img-src 'self' data: blob: https:; "
+        "media-src 'self' blob:; "
+        "connect-src 'self' https: wss: ws:; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    )
+    return response
+
+
 @app.middleware("http")
 async def limit_request_body(request: Request, call_next):
     """Early guard: Content-Length bilan kelgan haddan tashqari katta POST/PUT/PATCH ni
@@ -2362,15 +2402,60 @@ def process_turn_api(
     return basic_result
 
 
-# Helper to validate password strength
+# Helper to validate password strength (#57)
+# Davlat tizimi uchun: 10+ belgi, kichik+katta+raqam+maxsus
 def validate_password_strength(password: str):
-    if len(password) < 8:
-        raise HTTPException(status_code=400, detail="Пароль должен содержать минимум 8 символов")
+    if len(password) < 10:
+        raise HTTPException(status_code=400, detail="Пароль должен содержать минимум 10 символов")
     if not re.search("[a-z]", password):
         raise HTTPException(status_code=400, detail="Пароль должен содержать хотя бы одну строчную букву")
+    if not re.search("[A-Z]", password):
+        raise HTTPException(status_code=400, detail="Пароль должен содержать хотя бы одну заглавную букву")
     if not re.search("[0-9]", password):
         raise HTTPException(status_code=400, detail="Пароль должен содержать хотя бы одну цифру")
+    if not re.search(r"[!@#$%^&*()_+\-=\[\]{};':\",.<>/?\\|`~]", password):
+        raise HTTPException(status_code=400, detail="Пароль должен содержать хотя бы один спецсимвол (!@#$...)")
+    # Eng keng tarqalgan zaif parollarni rad etamiz
+    common_weak = {"password", "12345678", "qwerty123", "admin1234", "letmein01"}
+    if password.lower() in common_weak:
+        raise HTTPException(status_code=400, detail="Этот пароль слишком распространён")
     return True
+
+
+# ===== Account lockout (#55) — brute force himoya =====
+# In-memory tracker (single-instance). Multi-instance uchun Redis kerak.
+_LOGIN_ATTEMPTS: dict[str, list[float]] = {}  # email → [timestamp, ...]
+_LOCKOUT_THRESHOLD = 5         # 5 marta xato
+_LOCKOUT_WINDOW_SEC = 900      # 15 daqiqa oynada
+_LOCKOUT_DURATION_SEC = 900    # 15 daqiqa bloklash
+
+def check_account_lockout(email: str):
+    """Email bo'yicha urinishlar sonini tekshirish. Cheklov oshilgan
+    bo'lsa 429 qaytaradi. Foydalanish: login endpoint boshida chaqirish."""
+    import time as _time
+    now = _time.time()
+    history = _LOGIN_ATTEMPTS.get(email, [])
+    # Eski yozuvlarni tozalash
+    history = [t for t in history if now - t < _LOCKOUT_WINDOW_SEC]
+    _LOGIN_ATTEMPTS[email] = history
+    if len(history) >= _LOCKOUT_THRESHOLD:
+        oldest = history[0]
+        retry_after = int(_LOCKOUT_DURATION_SEC - (now - oldest))
+        if retry_after > 0:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Слишком много попыток входа. Попробуйте через {retry_after // 60 + 1} мин.",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+def record_login_failure(email: str):
+    """Login muvaffaqiyatsiz bo'lganda chaqiriladi."""
+    import time as _time
+    _LOGIN_ATTEMPTS.setdefault(email, []).append(_time.time())
+
+def clear_login_attempts(email: str):
+    """Muvaffaqiyatli loginda urinishlar tarixi tozalanadi."""
+    _LOGIN_ATTEMPTS.pop(email, None)
 
 def _prune_old_frames(frames_dir: Path, max_age_sec: int) -> None:
     """Best-effort cleanup — delete JPEGs older than max_age_sec."""
@@ -2727,14 +2812,47 @@ def login(
     password: str = Form(...),
     db: Session = Depends(get_db),
 ):
+    # #55 Account lockout — 5 marta xato login bo'lsa 15 daq blok
+    check_account_lockout(email)
+
     user = db.query(database.User).filter(database.User.email == email).first()
     if not user or not verify_password(password, user.password):
+        # Xato urinish — tracker'ga yoziladi
+        record_login_failure(email)
+        # Audit log (faqat email saqlanadi, parol emas)
+        try:
+            from utils.audit import log_audit
+            log_audit(
+                db, None,
+                action="login_failed",
+                entity_type="auth",
+                entity_label=email,
+                request=request,
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=401, detail="Неверный email или пароль")
+
+    # Muvaffaqiyatli login — lockout tarixi tozalanadi
+    clear_login_attempts(email)
 
     # Track login activity
     user.login_count = (user.login_count or 0) + 1
     user.last_login = datetime.datetime.utcnow()
     db.commit()
+
+    # Audit log — kim qaysi IP'dan kirdi
+    try:
+        from utils.audit import log_audit
+        log_audit(
+            db, user,
+            action="login",
+            entity_type="auth",
+            entity_label=email,
+            request=request,
+        )
+    except Exception:
+        pass
 
     access_token_expires = datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
