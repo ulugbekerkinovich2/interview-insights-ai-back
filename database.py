@@ -91,6 +91,11 @@ class Candidate(Base):
     answers = Column(JSON, default=list)
     filters = Column(JSON, default=list)  # Per-candidate HR requirements (list of strings)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    # Soft delete — tasodifan o'chirilgan kandidatlar 30 kun saqlanadi
+    # va admin paneldan tiklash imkoni bor. NULL = aktiv.
+    deleted_at = Column(DateTime, nullable=True, index=True)
+    deleted_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
 
 class VisualRecord(Base):
     __tablename__ = "visual_records"

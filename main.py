@@ -814,6 +814,10 @@ async def startup():
                 # extension yo'q bo'lsa CREATE INDEX xatoga uchraydi, lekin try/except ushlaydi
                 "CREATE INDEX IF NOT EXISTS ix_audit_log_action ON audit_log (action)",
                 "CREATE INDEX IF NOT EXISTS ix_audit_log_entity_type ON audit_log (entity_type)",
+                # Soft delete — candidates jadvali uchun
+                "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP",
+                "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS deleted_by INTEGER REFERENCES users(id) ON DELETE SET NULL",
+                "CREATE INDEX IF NOT EXISTS ix_candidates_deleted_at ON candidates (deleted_at)",
             ]:
                 try:
                     conn.execute(_sa_text(ddl))
@@ -1134,6 +1138,66 @@ def health_check():
     }
 
 
+@app.get("/health/live")
+def health_live():
+    """Liveness probe — jarayon ishlaydimi (Kubernetes uchun).
+    Tashqi dependency'lar (DB/Redis/Qdrant) tekshirilmaydi — process'ning
+    o'zi javob bersa kifoya. K8s liveness uchun.
+    """
+    return {"status": "alive"}
+
+
+@app.get("/health/ready")
+def health_ready():
+    """Readiness probe — barcha dependency'lar tayyormi (Kubernetes uchun).
+    DB, Redis, Qdrant alohida ping qilinadi.
+    Kamida bittasi mavjud bo'lmasa 503 qaytaradi.
+    """
+    checks = {}
+    overall_ok = True
+
+    # 1) PostgreSQL
+    try:
+        database.check_database_connection()
+        checks["database"] = {"ok": True, "dialect": database.get_database_metadata()["dialect"]}
+    except Exception as exc:
+        checks["database"] = {"ok": False, "error": str(exc)[:200]}
+        overall_ok = False
+
+    # 2) Redis (Celery broker)
+    try:
+        import redis as _redis
+        broker_url = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
+        client = _redis.from_url(broker_url, socket_connect_timeout=2, socket_timeout=2)
+        client.ping()
+        checks["redis"] = {"ok": True}
+    except Exception as exc:
+        checks["redis"] = {"ok": False, "error": str(exc)[:200]}
+        # Redis bo'lmasa Celery ishlamaydi, lekin sync mode'da sayt ishlaydi
+        # shuning uchun overall_ok = False qilmaymiz, faqat degraded deb belgilab qo'yamiz
+        checks["redis"]["severity"] = "warning"
+
+    # 3) Qdrant (vector DB — RAG uchun)
+    try:
+        qdrant_url = os.getenv("QDRANT_URL")
+        if qdrant_url:
+            import requests as _req
+            headers = {}
+            if os.getenv("QDRANT_API_KEY"):
+                headers["api-key"] = os.getenv("QDRANT_API_KEY", "")
+            r = _req.get(f"{qdrant_url.rstrip('/')}/", headers=headers, timeout=3)
+            checks["qdrant"] = {"ok": r.ok}
+        else:
+            checks["qdrant"] = {"ok": False, "error": "QDRANT_URL not configured"}
+    except Exception as exc:
+        checks["qdrant"] = {"ok": False, "error": str(exc)[:200], "severity": "warning"}
+
+    payload = {"status": "ready" if overall_ok else "not_ready", "checks": checks}
+    if not overall_ok:
+        return JSONResponse(status_code=503, content=payload)
+    return payload
+
+
 @app.get("/health/detail")
 def health_detail(_: database.User = Depends(require_admin)):
     """Kengaytirilgan diagnostika: thread pool yuklamasi, Whisper holati,
@@ -1394,7 +1458,7 @@ def read_candidates(
         if offset < 0:
             offset = 0
 
-    qs = db.query(Candidate)
+    qs = db.query(Candidate).filter(Candidate.deleted_at.is_(None))
 
     # Filter — status
     if status:
@@ -1436,8 +1500,9 @@ def count_candidates(
 ):
     """Pagination UI uchun jami count.
     Filter parametrlari /candidates/ bilan bir xil.
+    Soft-deleted kandidatlar count'da ham ko'rinmaydi.
     """
-    qs = db.query(Candidate)
+    qs = db.query(Candidate).filter(Candidate.deleted_at.is_(None))
     if status:
         qs = qs.filter(Candidate.status == status)
     if q:
@@ -1771,41 +1836,96 @@ def _delete_candidate_media(candidate_id: int, db: Session) -> dict:
 def delete_candidate(
     candidate_id: int,
     request: Request,
+    hard: bool = False,
     db: Session = Depends(get_db),
     user: database.User = Depends(require_role(["SuperAdmin", "Recruiter"])),
 ):
-    """Nomzodni to'liq o'chirish — GDPR "o'chirilish huquqi" (right to erasure).
-    DB yozuvlari (visual_records CASCADE orqali) + media fayllar (frames, audio)
-    birga o'chiriladi. Audit log'ga yoziladi."""
+    """Nomzodni o'chirish.
+
+    - Default: SOFT DELETE — `deleted_at` o'rnatiladi, 30 kun saqlanadi.
+      Ro'yxatda ko'rinmaydi, lekin admin panel orqali tiklash mumkin.
+    - `?hard=true`: HARD DELETE — DB yozuvlari + media fayllari to'liq
+      o'chadi. GDPR "o'chirilish huquqi" uchun. Faqat SuperAdmin.
+
+    Audit log'ga yoziladi.
+    """
     candidate = get_candidate_or_404(db, candidate_id)
-    # Snapshot — log uchun (delete'dan keyin candidate yo'q bo'ladi)
     snapshot = {
         "id": candidate.id,
         "name": candidate.name,
         "display_id": candidate.display_id,
         "status": candidate.status,
     }
-    media_stats = _delete_candidate_media(candidate_id, db)
-    db.query(database.VisualRecord).filter(database.VisualRecord.candidate_id == candidate_id).delete()
-    db.delete(candidate)
-    db.commit()
 
-    # Audit log (xato sukut bilan o'tadi — asosiy oqimni to'xtatmaydi)
+    if hard:
+        # Hard delete faqat SuperAdmin uchun
+        if (user.role or "").strip().lower() != "superadmin":
+            raise HTTPException(
+                status_code=403,
+                detail="Безвозвратное удаление доступно только SuperAdmin",
+            )
+        media_stats = _delete_candidate_media(candidate_id, db)
+        db.query(database.VisualRecord).filter(database.VisualRecord.candidate_id == candidate_id).delete()
+        db.delete(candidate)
+        db.commit()
+        action = "hard_delete"
+        result = {"status": "deleted", "mode": "hard", "media": media_stats}
+    else:
+        # Soft delete — qaytarib bo'ladigan o'chirish
+        candidate.deleted_at = datetime.datetime.utcnow()
+        candidate.deleted_by = user.id
+        db.commit()
+        action = "soft_delete"
+        result = {"status": "deleted", "mode": "soft", "restorable_until": (datetime.datetime.utcnow() + datetime.timedelta(days=30)).isoformat() + "Z"}
+
     try:
         from utils.audit import log_audit
         log_audit(
             db, user,
-            action="delete",
+            action=action,
             entity_type="candidate",
             entity_id=str(candidate_id),
             entity_label=snapshot["name"],
-            details={"deleted": snapshot, "media": media_stats},
+            details={"snapshot": snapshot, **result},
             request=request,
         )
     except Exception:
         pass
 
-    return {"status": "deleted", "media": media_stats}
+    return result
+
+
+@app.post("/candidates/{candidate_id}/restore")
+def restore_candidate(
+    candidate_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: database.User = Depends(require_role(["SuperAdmin", "Recruiter"])),
+):
+    """Soft-deleted kandidatni tiklash. `deleted_at` NULL ga qaytariladi."""
+    c = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="Не найдено")
+    if not c.deleted_at:
+        raise HTTPException(status_code=400, detail="Этот кандидат не был удалён")
+    c.deleted_at = None
+    c.deleted_by = None
+    db.commit()
+
+    try:
+        from utils.audit import log_audit
+        log_audit(
+            db, user,
+            action="restore",
+            entity_type="candidate",
+            entity_id=str(candidate_id),
+            entity_label=c.name,
+            request=request,
+        )
+    except Exception:
+        pass
+
+    return {"status": "restored", "id": candidate_id}
 
 
 @app.get("/candidates/{candidate_id}/gdpr-export")
