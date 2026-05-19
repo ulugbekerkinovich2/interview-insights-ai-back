@@ -723,6 +723,68 @@ async def limit_request_body(request: Request, call_next):
     return await call_next(request)
 
 
+
+# ====================================================================
+# #111 — Standard error response shape (opt-in)
+# Eski endpoint'lar `{detail: "..."}` qaytaradi (FastAPI default).
+# Yangi format: `{ok: false, error: {code, message, details}}` —
+# faqat `Accept: application/vnd.api+json` yoki `X-Error-Format: v2`
+# header bilan kelgan client'lar uchun. Bu backward-compat saqlaydi.
+# ====================================================================
+from fastapi import HTTPException as _HTTPException
+from fastapi.exceptions import RequestValidationError as _ReqValErr
+from fastapi.responses import JSONResponse as _JSONResp
+
+def _wants_v2_error(request) -> bool:
+    accept = request.headers.get("accept", "")
+    fmt = request.headers.get("x-error-format", "")
+    return "vnd.api+json" in accept or fmt == "v2"
+
+def _v2_error(status: int, code: str, message: str, details=None):
+    return {
+        "ok": False,
+        "error": {
+            "code": code,
+            "message": message,
+            "details": details,
+        },
+        "status": status,
+    }
+
+@app.exception_handler(_HTTPException)
+async def http_exception_handler_unified(request, exc: _HTTPException):
+    if _wants_v2_error(request):
+        # HTTPException.detail string yoki object bo'lishi mumkin
+        if isinstance(exc.detail, dict):
+            message = str(exc.detail.get("message") or exc.detail.get("detail") or "Error")
+            details = exc.detail
+        else:
+            message = str(exc.detail)
+            details = None
+        code = f"http_{exc.status_code}"
+        return _JSONResp(
+            status_code=exc.status_code,
+            content=_v2_error(exc.status_code, code, message, details),
+            headers=getattr(exc, "headers", None),
+        )
+    # Default — eski format saqlanadi
+    return _JSONResp(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=getattr(exc, "headers", None),
+    )
+
+@app.exception_handler(_ReqValErr)
+async def validation_exception_handler_unified(request, exc: _ReqValErr):
+    if _wants_v2_error(request):
+        return _JSONResp(
+            status_code=422,
+            content=_v2_error(422, "validation_error", "Запрос не прошёл валидацию", exc.errors()),
+        )
+    # FastAPI default
+    return _JSONResp(status_code=422, content={"detail": exc.errors()})
+
+
 # Role-based RAG knowledge-base API (/knowledge/*).
 app.include_router(knowledge_router)
 app.include_router(salary_router)
